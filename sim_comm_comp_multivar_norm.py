@@ -3,7 +3,7 @@ import pandas as pd
 from nlmpy import nlmpy
 from scipy.interpolate import BSpline
 from scipy.optimize import lsq_linear
-from scipy.stats import norm
+from scipy.stats import multivariate_normal
 import matplotlib.pyplot as plt
 import os
 import time
@@ -13,15 +13,10 @@ import rioxarray as rxr
 
 # TODO:
 
-    # DEBUGGING:
-        # add probability calc to expected spp distr map
-        # add env layers and arrow to niche center to spp distr plot
-
     # may need to reconsider how alpha div is determined/alpha raster is used
     # because right now there are still a lot of cells with 0 species niche
     # centers located there, and thus no guarantee that at least 1 species will
     # occur there
-    # --> OKAY TO JUST LEAVE ALPHA AS EMERGENT PROP AFTER ALL?
 
     # I wonder if GDM won't capture the patterns until survey is actually cast
     # as proper abundances rather than simple binary pres/abs?? though I think
@@ -251,17 +246,12 @@ def create_species(gamma,
     # melt env rasters' vals too
     env_ravel = [e.ravel() for e in env]
     # use alpha vals to draw all species niche centers
-    # (centers will always be a vector of values occurring on each of the
-    # environmental layers in the landscape)
-    spp_mus = []
-    for sp in range(gamma):
-        mu_inds = np.random.choice(a=range(len(alpha_trans)),
-                                   size=len(env),
-                                   replace=True,
-                                   # TODO: DECIDE IF LEAVE THIS OUT...
-                                   #p=alpha_trans,
-                                  )
-        spp_mus.append([e[i] for e, i in zip(env_ravel, mu_inds)])
+    # (centers will always be one of the env vectors occuring on the landscape)
+    mu_inds = np.random.choice(a=range(len(alpha_trans)),
+                               size=alpha_trans.shape,
+                               replace=True,
+                               p=alpha_trans,
+                              )
     # make debug plot comparing alpha raster and species' niche center locations
     if debug:
         counts = np.zeros(alpha_trans.shape)
@@ -284,6 +274,7 @@ def create_species(gamma,
         ax.set_title('rast of species niche center locs')
         fig_alpha_vs_niche_cents.suptitle('from create_species() fn:')
         fig_alpha_vs_niche_cents.show()
+    spp_mus = [[e[i] for e in env_ravel] for i in mu_inds]
     # use spline slope at each μ to draw each σ
     # (Bush et al. 2018 calculate niche width as 3.09/slope,
     # where 3.09 is the ecological distance at which two communities are
@@ -321,41 +312,46 @@ def do_survey(env,
     survey = []
     # get environmental values at point grid cell i,j
     # NOTE: points sit at cell centers, so int() converts to their cell indices
-    env_vals = [e[int(i), int(j)] for e in env]
+    env_vals = np.array([e[int(i), int(j)] for e in env])
     # decide whether each species is present at the grid cell
     for sp, niche in spp.items():
-        # list of probability densities extracted from the normal distributions
-        # describing the species' niches on each environmental axis
-        probs = []
-        for n, e in enumerate(env_vals):
-            # get probability of presence for this axis by determining the
-            # probability of drawing, from the species' niche distribution
-            # on this environmental axis, a value equally or more extreme
-            # than the survey position's environmental value
-            # NOTE: calculating and then subtracting difference between survey
-            #       location's environmental value and niche center, then
-            #       subtracting that from the niche center in the CDF
-            #       calculation, thus getting the probability of a value being
-            #       that far below the niche center; then multiply by two to
-            #       get two-tailed probability of a value as extreme or more so
-            diff = np.abs(e-niche[n][0])
-            prob = 2 * (norm.cdf(x=niche[n][0]-diff,
-                                 loc=niche[n][0],
-                                 scale=niche[n][1],
-                                ))
-            assert 0 <= prob <= 1
-            probs.append(prob)
-        # determine overall probability of presence as the product of all
-        # probabilities (i.e., the joint probability across all
-        # environmental axes, treating the axes as if they are independent...
-        # NOTE: ... even though in reality we could actually fold in cross-layer
+        # get arrays of niche centers and niche widths
+        mus = np.array([n[0] for n in niche])
+        sigmas = np.array([n[1] for n in niche])
+        # construct covariance matrix (NOTE: without covariance between layers!)
+        covar = np.zeros([len(mus)]*2)
+        covar[np.diag_indices_from(covar)] = sigmas
+        # get probability of presence using the cumulative distribution
+        # function of the multivariate normal described by the species' niche
+        # distributions on all axes (modeled as the probability of drawing
+        # from within the species' multivariate normal niche space
+        # a series of environmental values equally extreme as or more extreme
+        # than the environmental values observed as the survey position)
+        # NOTE: calculating and then subtracting difference between survey
+        #       location's environmental values and multivariate niche center,
+        #       then subtracting that from the niche center in the CDF
+        #       calculation, thus getting the probability of a value being
+        #       that far below the niche center; then multiplying by two to
+        #       get the two-tailed probability of a value as extreme or more so)
+        diffs = np.abs(env_vals-mus)
+        distr = multivariate_normal(mean=mus, cov=covar, allow_singular=False)
+        prob = 2 * distr.cdf(x=mus-diffs)
+        assert 0 <= prob <= 1
+        # determine presence as a Bernoulli draw on that probability
+        # NOTE: ... treating all layers as independent, even though
+        #       in reality we could actually fold in cross-layer
         #       correlation to account for chance non-independence between
         #       environmental axes...)
         # NOTE: ... we also ignore spatial autocorrelation of presence in real
         #       species by ignoring any information about whether or not the
         #       species has been determined present in proximal locations...
-        prob_tot = np.prod(probs)**(1/3)
-        if np.random.binomial(1, prob_tot):
+        if debug:
+            print('\n============')
+            print(f"\n\tENV: {env_vals}")
+            print(f"\n\tNICHE CENTER: {mus}")
+            print(f"\n\tNICHE COVAR: {covar}")
+            print(f"\n\tPROB: {prob}")
+        if np.random.binomial(1, prob):
             survey.append(sp)
     return survey
 
@@ -520,16 +516,16 @@ def run_sim(env,
 
     # run GDM and return results
     print(f"\n\nRUNNING GDM...\n\n")
-    gdm_splines, gdm_pca_rast = run_GDM(gamma,
-                                        surveys,
-                                        survey_points,
-                                        env,
-                                        site_survey_filename=site_survey_filename,
-                                        env_rast_filename=env_rast_filename,
-                                        spline_filename=spline_filename,
-                                        pca_rast_filename=pca_rast_filename,
-                                       )
-    return spp, surveys, samples, gdm_splines, gdm_pca_rast
+    splines, pca_rast = run_GDM(gamma,
+                                surveys,
+                                survey_points,
+                                env,
+                                site_survey_filename=site_survey_filename,
+                                env_rast_filename=env_rast_filename,
+                                spline_filename=spline_filename,
+                                pca_rast_filename=pca_rast_filename,
+                               )
+    return spp, surveys, samples, splines, pca_rast
 
 
 class Sim:
@@ -568,8 +564,8 @@ class Sim:
         if timeit:
             stop = time.time()
             self._runtime_sec = stop-start
-            print((f"\n\nSIMULATION RAN IN {np.round(self._runtime_sec/60, 2)} "
-                   "MINUTES.\n\n"))
+            print((f"\n\n\tsimulation ran in {np.round(self._runtime_sec, 1)} "
+                   "seconds.\n\n"))
         self.spp = spp
         self.surveys = surveys
         self.samples = samples
@@ -627,11 +623,10 @@ class Sim:
         for pt, survey in zip(self.points, self.surveys):
             survey_len_arr[int(pt[0]), int(pt[1])] = len(survey)
         survey_lengths = [len(survey) for survey in self.surveys]
-        img = ax.imshow(survey_len_arr,
-                        vmin=min(survey_lengths),
-                        vmax=max(survey_lengths),
-                       )
-        plt.colorbar(img)
+        ax.imshow(survey_len_arr,
+                  vmin=min(survey_lengths),
+                  vmax=max(survey_lengths),
+                 )
         ax.set_title('α-diversity at survey sites', size=14)
 
         # plot PCA rast from GDM transform
@@ -662,13 +657,13 @@ class Sim:
                        )
 
     def plot_expec_vs_obser_distr(self,
-                                  sp,
+                                  i,
                                   ax_expec=None,
                                   ax_obser=None,
                                   cmap='viridis',
                                  ):
         '''
-        plot both the expected and observed distribution the species
+        plot both the expected and observed distribution of species i
         '''
         assert ((ax_expec is None and ax_obser is None) or
                 (ax_expec is not None and ax_obser is not None)), ("axes "
@@ -676,7 +671,7 @@ class Sim:
                                 "expected and observed distribution plots "
                                 "or for neither.")
         # get species' niche
-        niche = self.spp[sp]
+        niche = self.spp[i]
         # calculate map of expected distribution
         expec = np.zeros(self.env[0].shape)
         for i, e in enumerate(self.env):
@@ -688,7 +683,7 @@ class Sim:
         # (setting pixels without surveys to NaNs)
         obser = np.zeros(self.env[0].shape)
         for pt, survey in zip(self.points, self.surveys):
-            if sp in survey:
+            if i in survey:
                 obser[int(pt[0]), int(pt[1])] = 1
         for i in range(self.env[0].shape[0]):
             for j in range(self.env[0].shape[1]):
@@ -706,15 +701,16 @@ class Sim:
                         vmin=0,
                         vmax=1,
                        )
-        ax_expec.set_title(f'expected distribution for species {sp}')
+        ax_expec.set_title(f'expected distribution for species {i}')
         ax_obser.imshow(obser,
                          cmap=cmap,
                          vmin=0,
                          vmax=1,
                         )
-        ax_obser.set_title(f'observed distribution for species {sp}')
+        ax_obser.set_title(f'observed distribution for species {i}')
         if show_fig:
             fig.show()
+
 
 
 ####################
@@ -781,7 +777,7 @@ if PLOT_IT:
             )
     # plot expected vs. observed distribution for random species
     sp = 0
-    sim.plot_expec_vs_obser_distr(sp=sp,
+    sim.plot_expec_vs_obser_distr(i=sp,
                                   cmap='viridis',
                                  )
 
