@@ -5,8 +5,9 @@ library(terra)
 args <- commandArgs(trailingOnly = TRUE)
 site_survey_filename = args[1]
 env_rast_filename = args[2]
-spline_filename = args[3]
-pca_rast_filename = args[4]
+abundance = as.logical(args[3])
+spline_filename = args[4]
+pca_rast_filename = args[5]
 
 # read site-survey table
 site_survey = read.csv(site_survey_filename)
@@ -17,6 +18,7 @@ env_rast = terra::rast(env_rast_filename)
 # format data for analysis
 site_pair = gdm::formatsitepair(bioData=site_survey,
                                 bioFormat=1,
+                                abundance=abundance,
                                 siteColumn='site',
                                 XColumn='x',
                                 YColumn='y',
