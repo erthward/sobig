@@ -17,25 +17,20 @@ import rioxarray as rxr
 
 # TODO:
 
-    # DEBUGGING:
-        # check again how GDM splines/etc are typically plotted
-
-        # get rid of alpha? once decided, update functions as well as
-        # docstrings and plot
-
-        # add type annotation!
-
     # may need to reconsider how alpha div is determined/alpha raster is used
     # because right now there are still a lot of cells with 0 species niche
     # centers located there, and thus no guarantee that at least 1 species will
     # occur there
     # --> OKAY TO JUST LEAVE ALPHA AS EMERGENT PROP AFTER ALL?
+    #     if so, get rid of alpha? once decided, update functions
+    #     as well as docstrings and plot
 
-    # I wonder if GDM won't capture the patterns until survey is actually cast
-    # as proper abundances rather than simple binary pres/abs?? though I think
-    # GDM should work just fine with pres/abs...
 
-    # work through numerical artefacts:
+    # why did changing from pres/abs to abund seem to drastically improve GDM
+    # results? retry and double-check
+
+    # work through numerical artefacts that we need to carefully consider and
+    # make decisions on:
         # using normal distribution across the [0,1] interval, so many will
         # extend outside it
 
@@ -45,15 +40,12 @@ import rioxarray as rxr
         # need to use gamma to somehow constrain min and max alpha values that
         # occur on the map? (i.e., least and most diverse communities)
 
-        # does ignoring spatial autocorrelation in presence/absence
+        # does ignoring spatial autocorrelation in the presence/absence
         # determination create any major problems?
 
         # does ignoring the chance correlation between environmental layers
         # (e.g., by calculating overall presence prob as the prod of
         # independent presence probs on each axis) create any problems?
-
-        # should max prob presence, even at the cell defining the niche center,
-        # be <1.0?
 
     # thoroughly review ChatGPT-derived I-spline code and improve or replace
 
@@ -195,15 +187,20 @@ class Sim:
                  splines: list[Type[ISpline]],
                  alpha: rasterlike,
                  gamma: int,
-                 survey_points: List[Tuple[float]],
+                 survey_sites: List[Tuple[float]],
+                 min_niche_sigma: float = 0.001,
+                 max_niche_sigma: float = 0.1,
                  use_multivar_normal_niche: bool = False,
                  prob_pres_thresh_round_to_1: Optional[float] = None,
                  max_poisson_lambda_val: int = 1000,
-                 gdm_pres_abund: bool = True,
+                 gdm_data_type: str = 'abund',
                  verbose: bool = False,
                  debug: bool = False,
                  timeit: bool = True,
                 ) -> None:
+        # validate args
+        assert isinstance(gdm_data_type, str)
+        assert gdm_data_type in ['abund', 'pres_abs']
         # store behavioral params
         self._verbose = verbose
         self._debug = debug
@@ -215,7 +212,7 @@ class Sim:
         self.splines = splines
         self.alpha = alpha
         self.gamma = gamma
-        self.points = survey_points
+        self.sites = survey_sites
         # run and save the simulation
         if self._timeit:
             start = time.time()
@@ -224,15 +221,17 @@ class Sim:
          surveys,
          samples,
          gdm_splines,
-         gdm_pca_rast) = run_sim(env=ENV,
-                                 splines=SPLINES,
-                                 alpha=ALPHA,
-                                 gamma=GAMMA,
+         gdm_pca_rast) = run_sim(env=env,
+                                 splines=splines,
+                                 alpha=alpha,
+                                 gamma=gamma,
+                                 min_niche_sigma=min_niche_sigma,
+                                 max_niche_sigma=max_niche_sigma,
                                  use_multivar_normal_niche=self._use_multivar_normal_niche,
                                  prob_pres_thresh_round_to_1=self._prob_pres_thresh_round_to_1,
                                  max_poisson_lambda_val=max_poisson_lambda_val,
-                                 gdm_pres_abund=gdm_pres_abund,
-                                 survey_points=POINTS,
+                                 gdm_data_type=gdm_data_type,
+                                 survey_sites=survey_sites,
                                  verbose=self._verbose,
                                  debug=self._debug,
                                 )
@@ -247,12 +246,12 @@ class Sim:
         self.samples = samples
         self.gdm_splines = gdm_splines
         self.gdm_pca_rast = gdm_pca_rast
-        # useful hidden attributes
+        # hidden utility attributes
         self._env_cmaps = ['Reds', 'Greens', 'Blues']
 
 
     def plot(self,
-             scatter_survey_points: bool = True,
+             scatter_survey_sites: bool = True,
              save: bool = False,
             ) -> None:
         '''
@@ -268,9 +267,9 @@ class Sim:
                                     (i*axwidth)+(i*1):((i+1)*axwidth)+((i+1)*1)])
             img = ax.imshow(e, vmin=0, vmax=1, cmap=self._env_cmaps[i])
             plt.colorbar(img)
-            # add survey points
-            if scatter_survey_points:
-                for point in self.points:
+            # add survey sites
+            if scatter_survey_sites:
+                for point in self.sites:
                     ax.scatter(point[0],
                                point[1],
                                color='white',
@@ -300,7 +299,7 @@ class Sim:
         # plot raster of observed alpha values at all surveyed cells
         ax = fig.add_subplot(gs[50:, 35:65])
         survey_len_arr = np.ones(self.env[0].shape)*np.nan
-        for pt, survey in zip(self.points, self.surveys):
+        for pt, survey in zip(self.sites, self.surveys):
             survey_len_arr[int(pt[0]), int(pt[1])] = len(survey)
         survey_lengths = [len(survey) for survey in self.surveys]
         img = ax.imshow(survey_len_arr,
@@ -313,9 +312,9 @@ class Sim:
         # plot PCA rast from GDM transform
         ax = fig.add_subplot(gs[50:, 70:])
         self.gdm_pca_rast.plot.imshow(ax=ax)
-        # add survey points
-        if scatter_survey_points:
-            for point in self.points:
+        # add survey sites
+        if scatter_survey_sites:
+            for point in self.sites:
                 ax.scatter(point[0],
                            point[1],
                            color='white',
@@ -325,6 +324,7 @@ class Sim:
                           )
         ax.set_xlabel('')
         ax.set_ylabel('')
+        ax.set_aspect('equal')
         ax.set_title('top 3 PCs from GDM transform')
 
         # format plot and save
@@ -361,12 +361,12 @@ class Sim:
         # calculate map of all pixels where species is observed
         # (setting pixels without surveys to NaNs)
         obser = np.zeros(self.env[0].shape)
-        for pt, survey in zip(self.points, self.surveys):
+        for pt, survey in zip(self.sites, self.surveys):
             if sp in survey:
                 obser[int(pt[0]), int(pt[1])] = survey[sp]
         for i in range(self.env[0].shape[0]):
             for j in range(self.env[0].shape[1]):
-                if (i+0.5, j+0.5) not in self.points:
+                if (i+0.5, j+0.5) not in self.sites:
                     obser[i, j] = np.nan
         # plot both
         show_fig = False
@@ -446,10 +446,10 @@ def minmax_scale_rast(rast: rasterlike,
     return out
 
 
-def draw_random_survey_points(dims: Tuple[Union[float, int]],
-                              n: int) -> List[Tuple[float]]:
+def draw_random_survey_sites(dims: Tuple[Union[float, int]],
+                             n: int) -> List[Tuple[float]]:
     '''
-    draw a set of random survey points within a raster whose coordinates range
+    draw a set of random survey site points within a raster whose coordinates range
     from 0 to dim-1 in both axes in dims; each point will be in a separate
     pixel, so n must not exceed the number of pixels
     '''
@@ -460,7 +460,7 @@ def draw_random_survey_points(dims: Tuple[Union[float, int]],
     pts = [*zip(xs, ys)]
     np.random.shuffle(pts)
     idxs = np.random.choice(range(len(pts)), replace=False, size=n)
-    # NOTE: add 0.5 to all points, to place them in cell centers
+    # NOTE: add 0.5 to all site points, to place them in cell centers
     rand_pts = [tuple(np.array(pts[idx])+0.5) for idx in idxs]
     return rand_pts
 
@@ -667,7 +667,7 @@ def do_survey(env: List[rasterlike],
     # list to store all species present
     survey = {}
     # get environmental values at point grid cell i,j
-    # NOTE: points sit at cell centers, so int() converts to their cell indices
+    # NOTE: site points sit at cell centers, so int() converts to their cell indices
     env_vals = [e[int(i), int(j)] for e in env]
     for sp, niche in spp.items():
         # calculate presence probability
@@ -694,9 +694,9 @@ def do_survey(env: List[rasterlike],
 
 def prep_GDM_input_data(gamma: int,
                         surveys: List[Dict[int, int]],
-                        survey_points: List[Tuple[float]],
+                        survey_sites: List[Tuple[float]],
                         env: List[rasterlike],
-                        pres_abund: bool = True,
+                        bio_data_type: str = 'abund',
                         site_survey_filename: str = 'site_survey.csv',
                         env_rast_filename: str = 'env_rast.tif',
                        ) -> None:
@@ -713,15 +713,15 @@ def prep_GDM_input_data(gamma: int,
     # NOTE: add site column
     site_surv_mat[:, 0] = [*range(len(surveys))]
     for i, survey in enumerate(surveys):
-        # NOTE: adding x and y columns (points are expressed as (i, j) matrix
+        # NOTE: adding x and y columns (sites are expressed as (i, j) matrix
         #       indices, so flip them express as (x, y) geographic coordinates)
-        pt = survey_points[i]
+        pt = survey_sites[i]
         site_surv_mat[i, 1] = pt[1]
         site_surv_mat[i, 2] = pt[0]
         for j, abund in survey.items():
-            if pres_abund:
+            if bio_data_type == 'abund':
                 site_surv_mat[i, j+add_cols] = abund
-            else:
+            elif bio_data_type == 'pres_abs':
                 site_surv_mat[i, j+add_cols] = 1
     site_surv_df = pd.DataFrame(site_surv_mat)
     site_surv_df.columns = ['site', 'x', 'y'] + [f'spp{i}' for i in range(gamma)]
@@ -749,9 +749,9 @@ def prep_GDM_input_data(gamma: int,
 
 def run_GDM(gamma: int,
             surveys: List[Dict[int, int]],
-            survey_points: List[Tuple[float]],
+            survey_sites: List[Tuple[float]],
             env: List[rasterlike],
-            pres_abund: bool = True,
+            bio_data_type: str = 'abund',
             site_survey_filename: str = 'site_survey.csv',
             env_rast_filename: str = 'env_rast.tif',
             spline_filename: str = 'GDM_splines.csv',
@@ -764,15 +764,19 @@ def run_GDM(gamma: int,
     # prep and save GDM input data
     prep_GDM_input_data(gamma=gamma,
                         surveys=surveys,
-                        survey_points=survey_points,
+                        survey_sites=survey_sites,
                         env=env,
-                        pres_abund=pres_abund,
+                        bio_data_type=bio_data_type,
                         site_survey_filename=site_survey_filename,
                         env_rast_filename=env_rast_filename,
                        )
     # run R script
+    if bio_data_type == 'abund':
+        abund = 'TRUE'
+    else:
+        abund = 'FALSE'
     R_cmd = (f"Rscript --vanilla run_gdm.r {site_survey_filename} "
-             f"{env_rast_filename} {str(pres_abund).upper()} "
+             f"{env_rast_filename} {abund} "
              f"{spline_filename} {pca_rast_filename}")
     print(R_cmd)
     os.system(R_cmd)
@@ -798,7 +802,7 @@ def draw_sample(survey: Dict[int, int],
                    a rarefaction curve)
         *rel_abunds*: relative abundances (per species; used to extract species
                       from a rarefaction curve result)
-        *obs_probs*: observation probabilities (per species; used to update
+        *det_probs*: detection probabilities (per species; used to update
                      species results from the rarefaction curve to account for
                      uneven likelihoods of detection)
     '''
@@ -809,16 +813,16 @@ def run_sim(env: List[rasterlike],
             splines: List[Type[ISpline]],
             alpha: rasterlike,
             gamma: int,
-            survey_points: List[Tuple[float]],
-            min_niche_sigma: float = 0.05,
-            max_niche_sigma: float = 0.50,
+            survey_sites: List[Tuple[float]],
+            min_niche_sigma: float = 0.001,
+            max_niche_sigma: float = 0.10,
             use_multivar_normal_niche: bool = False,
             prob_pres_thresh_round_to_1: Optional[float] = None,
             max_poisson_lambda_val: int = 1000,
             spp_rel_abund: vectorlike = None,
-            spp_observ_prob: vectorlike = None,
+            spp_detect_prob: vectorlike = None,
             sampling_schemes: List[str] = ['all'],
-            gdm_pres_abund: bool = True,
+            gdm_data_type: str = 'abund',
             site_survey_filename: str = 'site_survey.csv',
             env_rast_filename: str = 'env_rast.tif',
             spline_filename: str = 'GDM_splines.csv',
@@ -832,14 +836,14 @@ def run_sim(env: List[rasterlike],
         assert scheme in ['all',
                           'random',
                           'rel_abund_weighted',
-                          'observ_prob_biased',
+                          'detect_prob_biased',
                          ]
     if 'rel_abund_weighted' in sampling_schemes:
         assert spp_rel_abund is not None
         assert len(spp_rel_abund) == gamma
-    if 'observ_prob_biased' in sampling_schemes:
-        assert spp_observ_prob is not None
-        assert len(spp_observ_prob) == gamma
+    if 'detect_prob_biased' in sampling_schemes:
+        assert spp_detect_prob is not None
+        assert len(spp_detect_prob) == gamma
     # create all species
     print(f"\n\nCREATING SPECIES...\n\n")
     spp, spp_max_poisson_lambdas = create_species(gamma=gamma,
@@ -856,10 +860,10 @@ def run_sim(env: List[rasterlike],
     print(f"\n\nDOING SURVEYS...\n\n")
     surveys = []
     ct = 0
-    for i, j in survey_points:
+    for i, j in survey_sites:
         if verbose:
             if ct%25 == 0:
-                print(f"\n\t{np.round(100*(ct/len(survey_points)), 1)}% complete...\n")
+                print(f"\n\t{np.round(100*(ct/len(survey_sites)), 1)}% complete...\n")
         survey = do_survey(env,
                            spp,
                            spp_max_poisson_lambdas,
@@ -886,9 +890,9 @@ def run_sim(env: List[rasterlike],
     print(f"\n\nRUNNING GDM...\n\n")
     gdm_splines, gdm_pca_rast = run_GDM(gamma,
                                         surveys,
-                                        survey_points,
+                                        survey_sites,
                                         env,
-                                        pres_abund=gdm_pres_abund,
+                                        bio_data_type=gdm_data_type,
                                         site_survey_filename=site_survey_filename,
                                         env_rast_filename=env_rast_filename,
                                         spline_filename=spline_filename,
@@ -909,9 +913,11 @@ PLOT_IT = True
 SAVEPLOTS = True
 
 USE_MULTIVAR_NORMAL_NICHE = False
-PROB_PRES_THRESH_ROUND_TO_1 = 0.7
+MIN_NICHE_SIGMA = 0.001
+MAX_NICHE_SIGMA = 0.10
+PROB_PRES_THRESH_ROUND_TO_1 = None
 MAX_POISSON_LAMBDA_VAL = 1000
-GDM_PRES_ABUND = True
+GDM_DATA_TYPE = 'abund'
 
 SEED = 2
 if SEED is not None:
@@ -959,21 +965,23 @@ else:
     assert isinstance(ALPHA, np.ndarray)
 GAMMA=10000
 
-# points to collect full surveys and samples at
+# sites to collect full surveys and samples at
 N_POINTS = None
 if N_POINTS is None:
     N_POINTS = np.prod(DIMS)
-POINTS = draw_random_survey_points(DIMS, N_POINTS)
+SITES = draw_random_survey_sites(DIMS, N_POINTS)
 
 sim = Sim(env=ENV,
           splines=SPLINES,
           alpha=ALPHA,
           gamma=GAMMA,
-          survey_points=POINTS,
+          survey_sites=SITES,
+          min_niche_sigma=MIN_NICHE_SIGMA,
+          max_niche_sigma=MAX_NICHE_SIGMA,
           use_multivar_normal_niche=USE_MULTIVAR_NORMAL_NICHE,
           prob_pres_thresh_round_to_1=PROB_PRES_THRESH_ROUND_TO_1,
           max_poisson_lambda_val=MAX_POISSON_LAMBDA_VAL,
-          gdm_pres_abund=GDM_PRES_ABUND,
+          gdm_data_type=GDM_DATA_TYPE,
           verbose=VERBOSE,
           debug=DEBUG,
           timeit=TIMEIT,
@@ -981,7 +989,7 @@ sim = Sim(env=ENV,
 
 # plot and save results
 if PLOT_IT:
-    sim.plot(scatter_survey_points=False,
+    sim.plot(scatter_survey_sites=False,
              save=SAVEPLOTS,
             )
     # plot expected vs. observed distribution for random species
