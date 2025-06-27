@@ -6,7 +6,7 @@ args <- commandArgs(trailingOnly = TRUE)
 site_survey_filename = args[1]
 env_rast_filename = args[2]
 abundance = as.logical(args[3])
-spline_filename = args[4]
+fits_filename = args[4]
 pca_rast_filename = args[5]
 
 # read site-survey table
@@ -28,9 +28,9 @@ site_pair = gdm::formatsitepair(bioData=site_survey,
 mod = gdm::gdm(site_pair, geo=F)
 print(summary(mod))
 
-# save I-splines
-splines = as.data.frame(isplineExtract(mod))
-write.csv(splines, spline_filename)
+# save fitted functions
+fits = as.data.frame(isplineExtract(mod))
+write.csv(fits, fits_filename)
 
 # save first <=3 PCs of GDM-transformed env space
 env_rast_trans <- gdm::gdm.transform(model=mod, data=env_rast)

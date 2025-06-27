@@ -2,3 +2,5 @@
 *.tif
 *.csv
 *.odp
+*.pptx
+scratch/*
