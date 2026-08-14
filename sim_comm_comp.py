@@ -3,6 +3,7 @@ import pandas as pd
 from typing import List, Tuple, Dict, Union, Optional, Type
 from copy import deepcopy
 from nlmpy import nlmpy
+from sklearn.neighbors import KernelDensity
 from dms_variants.ispline import Isplines
 import dms_variants
 from scipy.stats import norm, multivariate_normal
@@ -31,6 +32,14 @@ input parameters include:
 
 
 
+DECISIONS:
+    - should I just allow alpha coeffs to be used to draw directly from E-space distributions?
+      (if I allow alpha to be input as a raster, I could still roll back to that by just reversing it to E-space)
+    - TODO: calculate a-priori expectation for alpha assuming a raster of 1s, the  simulate and compare
+    - TODO: try to simulate Simon's example of even-width niches but higher
+    alpha in wetter places (1:1 f(Env) and wetter places more environmentally
+    common), and then my example of uneven-width niches but higher alpha in
+    wetter places (balanced environments but f(Env) steeper at arid end)
 
 
 
@@ -38,6 +47,17 @@ input parameters include:
 
 
 TODO:
+    - pick up with TODO: DELETE comments
+    - what to do about alpha?!?! winds up just correlated to pixel rarity in env space...
+    - move other functions to methods of Sim
+    - change alpha_coeffs to alpha, which can be either coeffs or a rast (with asserts)
+    - add functionality for removing species (based on niche width/specialization or something like that)
+    - consider how to hook into sklearn.model class predict function, for generationg of alpha/etc up front
+    - R gdm pkg:
+        - FIGURE OUT HOW TO INSTALL!
+        - either make it an optional dependency
+        - or figure out way to prep whole thing to be conda isntalled
+        - or port GDM to python?
     - add sampling function!
     - teaser scenarios:
         - show effects of sampling and sample site density on GAM richness model
@@ -51,8 +71,8 @@ TODO:
     - figure out bug with alpha rast as function of env
     - prevent our f(Env) functions from being anchored at 0 on y-axis?
     - finalize input vs GDM-fitted f(Env) plotting issues
-    - which is more justifiable, product of univars normals or multivar normal?
-    - is it a problem that we're ignoring spatial autocorr in pres/abs determination?
+    - which is more justifiable, product of univariate normals or multivar normal?
+    - is it a major problem that we're ignoring spatial autocorr in pres/abs determination? if so, add Gaussian random field?
     - add ability for knots and splines to be fed through as args to R's gdm()
 
 '''
@@ -68,6 +88,7 @@ TODO:
 numerical = Union[float, int]
 vectorlike = Union[List[numerical], Tuple[numerical], np.ndarray]
 rasterlike = Union[np.ndarray, xr.core.dataarray.DataArray]
+raster_or_vectorlike = Union[List[numerical], Tuple[numerical], np.ndarray, xr.core.dataarray.DataArray]
 
 
 #--------
@@ -77,7 +98,7 @@ rasterlike = Union[np.ndarray, xr.core.dataarray.DataArray]
 class fEnv:
     '''
     class for `f(Env)` function that relates environmental and ecological
-    distances as a monotone function (i.e., a linear combination of I-spline
+    distances as a monotonic function (i.e., a linear combination of I-spline
     basis functions with non-negative coefficients)
 
     Includes a method for getting the function's approximate slope at any value
@@ -100,6 +121,7 @@ class fEnv:
                                         "be 1 greater than number of knots.")
         assert self.coeffs[-1] == 0, ("to ensure slope of 0 at high end of "
                                 "f(Env), the final coefficient must be 0.0.")
+        # space environmental values evenly between 0 and 1000, if not provided
         if env_x_vals is None:
             env_x_vals = np.linspace(np.min(self.knots),
                                      np.max(self.knots), 1000)
@@ -165,7 +187,7 @@ class fEnv:
                                            )
         # create function as linear combination
         fenv = np.stack([coeffs[i-1] * isplines.I(i) for i in range(1,
-                                        isplines.n+1)]).sum(axis=0)/isplines.n 
+                                        isplines.n+1)]).sum(axis=0)/isplines.n
         return fenv, isplines
 
 
@@ -260,25 +282,28 @@ class fEnv:
 
 
 class Species:
-    # TODO: ADD DETECTION PROBS, ETC!
     '''
     class for a simulated species
     '''
     def __init__(self,
                  niche: list[vectorlike],
-                 niche_cent: list[tuple],
+                 # TODO: DELETE
+                 #niche_cent: list[tuple],
                  max_poisson_lambda: float,
                  prob_detect: float,
                 ) -> None:
         # validate args
-        assert len(niche) == len(niche_cent)
+        # TODO: DELETE
+        # assert len(niche) == len(niche_cent)
         for i in range(len(niche)):
             assert len(niche[i]) == 2 # mu and sigma
-            assert len(niche_cent[i]) == 2 # i and j cell coordinates
+            # TODO DELETE
+            #assert len(niche_cent[i]) == 2 # i and j cell coordinates
         assert prob_detect is None or 0 <= prob_detect <= 1
         # assign attributes
         self.niche = niche
-        self._niche_cent = niche_cent
+        # TODO DELETE
+        # self._niche_cent = niche_cent
         self.max_poisson_lambda = max_poisson_lambda
         self.prob_detect = prob_detect
 
@@ -291,7 +316,7 @@ class Sim:
                  env: List[rasterlike],
                  fenvs: list[Type[fEnv]],
                  gamma: int,
-                 alpha_coeffs: Optional[vectorlike] = None,
+                 alpha: Optional[raster_or_vectorlike] = None,
                  n_survey_sites: Optional[int] = None,
                  survey_sites: Optional[List[Tuple[float]]] = None,
                  min_niche_sigma: float = 0.001,
@@ -330,19 +355,30 @@ class Sim:
                         verbose=self._verbose,
                         debug=self._debug,
                        )
-        # multiply alpha coeffs by their layers of the environment, sum to a
-        # single raster, then self-normalize and melt, to develop a vector of
-        # probabilities of each of the raster cells serving as a species' niche
-        # center location
-        self.alpha_coeffs = alpha_coeffs
-        if self.alpha_coeffs is not None:
+        # TODO: DELETE alpha_coeffs and figure out how to handle None arg
+        if alpha is None:
+            self.alpha_coeffs = None
+            self.alpha_rast = None
+            self._alpha_probs = None
+        elif (isinstance(alpha, list) or
+              isinstance(alpha, tuple) or
+              (isinstance(alpha, np.ndarray) and len(alpha.shape) == 1)):
+            # multiply alpha coeffs by their layers of the environment, sum to a
+            # single raster, then self-normalize and melt
+            self.alpha_coeffs = alpha
             self.alpha_rast = np.stack([_rescale_arr(c*e) for c,
                     e in zip(self.alpha_coeffs, self.env)]).sum(axis=0)
             self.alpha_rast = self.alpha_rast/np.sum(self.alpha_rast)
             self._alpha_probs = self.alpha_rast.ravel()
+        elif ((isinstance(alpha, np.ndarray) and len(alpha.shape) == 2) or
+              isinstance(alpha, xr.core.dataarray.DataArray)):
+            self.alpha_coeffs = None
+            self.alpha_rast = np.array(alpha)
+            self._alpha_probs = self.alpha_rast.ravel()
         else:
-            self.alpha_rast = None
-            self._alpha_probs = None
+            raise TypeError
+        # make niche KDE
+        self._make_niche_kde()
         # handle survey_sites
         if survey_sites is None:
             if n_survey_sites is None:
@@ -356,21 +392,21 @@ class Sim:
         self.sites = survey_sites
         self.n_sites = len(self.sites)
         # create all species
-        self._runtime_make_species = None
+        self._make_all_species_runtime = None
         if self._timeit:
             start = time.time()
         if self._verbose:
             print(f"\n\nCREATING SPECIES...\n\n")
-        self._make_species(max_poisson_lambdas=max_poisson_lambdas,
-                           detect_probs=detect_probs,
-                          )
+        self._make_all_species(max_poisson_lambdas=max_poisson_lambdas,
+                               detect_probs=detect_probs,
+                              )
         if self._timeit:
             stop = time.time()
             runtime_sec = stop-start
-            self._runtime_make_species = runtime_sec
+            self._make_all_species_runtime = runtime_sec
             if self._verbose:
                 print(("\n\nALL SPECIES CREATED IN "
-                       f"{np.round(self._runtime_make_species/60, 2)} "
+                       f"{np.round(self._make_all_species_runtime/60, 2)} "
                        "MINUTES.\n\n"))
         # simulate the communities
         self._runtime_sim_comms = None
@@ -422,31 +458,57 @@ class Sim:
             self._sim_comms(verbose=verbose, timeit=timeit, debug=debug)
 
 
-    def _make_species(self,
-                      max_poisson_lambdas: Optional[vectorlike] = None,
-                      detect_probs: Optional[vectorlike] = None,
-                     ) -> None:
+    def _make_niche_kde(self,
+                        kernel='gaussian',
+                        bandwidth='scott',
+                       ):
+        draw_cts = np.round(self.alpha_rast/np.min(self.alpha_rast), 0)-1
+        assert np.all(draw_cts % 1 == 0)
+        draw_lists = []
+        for e in self.env:
+            draws = []
+            for i, ct in enumerate(draw_cts.ravel()):
+                for n in range(int(ct)):
+                    draws.append(e.ravel()[i])
+            draw_lists.append(draws)
+        kde = KernelDensity(kernel=kernel,
+                            bandwidth=bandwidth).fit(np.array(np.array(draw_lists).T))
+        self._niche_kde = kde
+
+
+    def _make_all_species(self,
+                          max_poisson_lambdas: Optional[vectorlike] = None,
+                          detect_probs: Optional[vectorlike] = None,
+                         ) -> None:
         '''
         create a dict of all species' ecological niches
         (i.e., μ and σ values for all environmental layers)
         '''
-        # melt env rasters' vals too
-        env_ravel = [e.ravel() for e in self.env]
-        # (centers will always be a vector of values occurring on each of the
-        # environmental layers in the landscape)
-        spp_mus = []
-        # will also store the (i, j) coordinates corresponding to the niche
-        # centers on each axis
-        i_inds, j_inds = [inds.ravel() for inds in np.indices(self._dims)]
-        niche_cents = []
-        for sp in range(self.gamma):
-            mu_ind = np.random.choice(a=range(np.prod(self._dims)),
-                                      p=self._alpha_probs,
-                                     )
-            # save niche center
-            niche_cents.append([(i_inds[mu_ind],
-                                   j_inds[mu_ind])] * self._n_lyrs)
-            spp_mus.append([e[mu_ind] for e in env_ravel])
+        # TODO DELETE
+        ## melt env rasters' vals too
+        #env_ravel = [e.ravel() for e in self.env]
+        ## (centers will always be a vector of values occurring on each of the
+        ## environmental layers in the landscape)
+        #spp_mus = []
+        ## will also store the (i, j) coordinates corresponding to the niche
+        ## centers on each axis
+        #i_inds, j_inds = [inds.ravel() for inds in np.indices(self._dims)]
+        #niche_cents = []
+        #mu_inds = []
+        #for sp in range(self.gamma):
+        #    mu_ind = np.random.choice(a=range(np.prod(self._dims)),
+        #                              p=self._alpha_probs,
+        #                             )
+        #    # save niche center
+        #    niche_cents.append([(i_inds[mu_ind],
+        #                           j_inds[mu_ind])] * self._n_lyrs)
+        #    spp_mus.append([e[mu_ind] for e in env_ravel])
+        #    mu_inds.append(mu_ind)
+        #self.mu_inds = mu_inds
+
+        # draw species' niche centers from the niche KDE
+        spp_mus = self._niche_kde.sample(self.gamma)
+
         # draw species' lambdas for Poisson distributions determining survey
         # results (will be multiplied by probability of presence at a location, so
         # this is the maximum value that a Poisson draw will take in a location
@@ -500,7 +562,8 @@ class Sim:
                 # environmental layer
             # create and save the Species
             sp = Species(niche=niche,
-                         niche_cent=niche_cents[s],
+                         # TODO: DELETE
+                         #niche_cent=niche_cents[s],
                          max_poisson_lambda=max_poisson_lambdas[s],
                          prob_detect=detect_probs[s],
                         )
@@ -514,7 +577,7 @@ class Sim:
                    debug: Optional[bool] = None,
                   ) -> None:
         '''
-        Returns a dict of observation lists, keyed to sampling schemes, if more
+        Produces a dict of observation lists, keyed to sampling schemes, if more
         than one sampling scheme provided. Otherwise, returns an observation
         list for the single sampling scheme.
         '''
@@ -819,7 +882,8 @@ class Sim:
         '''
         # get species' niche
         niche = self.spp[sp].niche
-        niche_cent = self.spp[sp]._niche_cent
+        # TODO DELETE
+        #niche_cent = self.spp[sp]._niche_cent
         # calculate map of expected distribution
         expec = np.zeros(self.env[0, :, :].shape)
         # calculate presence probability at all cells
@@ -866,15 +930,16 @@ class Sim:
             plt.colorbar(img)
             # plot niche center loc
             # NOTE: (i, j) gets plotted (cent[0], cent[1]) for (x,y)
-            ax.scatter(niche_cent[i][1],
-                       niche_cent[i][0],
-                       marker='*',
-                       s=35,
-                       c='yellow',
-                       edgecolor='black',
-                       linewidth=0.25,
-                       alpha=0.8,
-                      )
+            # TODO DELETE
+            #ax.scatter(niche_cent[i][1],
+            #           niche_cent[i][0],
+            #           marker='*',
+            #           s=35,
+            #           c='yellow',
+            #           edgecolor='black',
+            #           linewidth=0.25,
+            #           alpha=0.8,
+            #          )
             ax.set_title("$Env_%s$" % i, size=14)
         img = ax_expec.imshow(expec,
                               cmap=cmap,
@@ -892,18 +957,19 @@ class Sim:
         fig.subplots_adjust(hspace=0.25,
                             wspace=0.25,
                            )
-        for ax in [ax_expec, ax_obser]:
-            for i in range(self._n_lyrs):
+        # TODO DELETE
+        #for ax in [ax_expec, ax_obser]:
+            #for i in range(self._n_lyrs):
                 # NOTE: (i, j) gets plotted (cent[0], cent[1]) for (x,y)
-                ax.scatter(niche_cent[i][1],
-                           niche_cent[i][0],
-                           marker='*',
-                           s=35,
-                           c='yellow',
-                           edgecolor='black',
-                           linewidth=0.25,
-                           alpha=0.8,
-                          )
+                #ax.scatter(niche_cent[i][1],
+                #           niche_cent[i][0],
+                #           marker='*',
+                #           s=35,
+                #           c='yellow',
+                #           edgecolor='black',
+                #           linewidth=0.25,
+                #           alpha=0.8,
+                #          )
         fig.show()
         if save:
            fig.savefig(f'comm_sim_sp{sp}_expec_vs_obser_distr.png',
@@ -1095,7 +1161,7 @@ def _sim_comm(env: rasterlike,
     return survey
 
 
-def _rarefaction_curve(N: int,
+def _calc_rarefaction_curve(N: int,
                        comm: Dict[int, int],
                        effort: float,
                       ):
@@ -1284,8 +1350,8 @@ ENV = [_rescale_arr(e, new_scale=fenv._x_minmax) for fenv, e in zip(FENV, ENV)]
 
 # params to determine 'inventory' diversities (a la Whittaker)
 GAMMA=2000
-#ALPHA_COEFFS = None
-ALPHA_COEFFS = [0.5, 1, 0.01]
+#ALPHA = None
+ALPHA = [0.5, 1, 0.01]
 
 # species-species lambdas (for ~Pois distributions determining abundance)
 MAX_POISSON_LAMBDAS = None
@@ -1297,7 +1363,7 @@ DETECT_PROBS = None
 sim = Sim(env=ENV,
           fenvs=FENV,
           gamma=GAMMA,
-          alpha_coeffs=ALPHA_COEFFS,
+          alpha=ALPHA,
           n_survey_sites=None,
           survey_sites=None,
           min_niche_sigma=MIN_NICHE_SIGMA,
@@ -1311,6 +1377,7 @@ sim = Sim(env=ENV,
           debug=DEBUG,
           timeit=TIMEIT,
          )
+assert False
 # run GDM on full communities
 sim.run_GDM(surveys=None)
 
@@ -1386,3 +1453,7 @@ for s in sp:
 #               )
 #
 #
+
+
+
+
