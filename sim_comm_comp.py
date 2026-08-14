@@ -32,27 +32,10 @@ input parameters include:
 
 
 
-DECISIONS:
-    - should I just allow alpha coeffs to be used to draw directly from E-space distributions?
-      (if I allow alpha to be input as a raster, I could still roll back to that by just reversing it to E-space)
-    - TODO: calculate a-priori expectation for alpha assuming a raster of 1s, the  simulate and compare
-    - TODO: try to simulate Simon's example of even-width niches but higher
-    alpha in wetter places (1:1 f(Env) and wetter places more environmentally
-    common), and then my example of uneven-width niches but higher alpha in
-    wetter places (balanced environments but f(Env) steeper at arid end)
-
-
-
-
-
-
 TODO:
     - pick up with TODO: DELETE comments
-    - what to do about alpha?!?! winds up just correlated to pixel rarity in env space...
     - move other functions to methods of Sim
-    - change alpha_coeffs to alpha, which can be either coeffs or a rast (with asserts)
     - add functionality for removing species (based on niche width/specialization or something like that)
-    - consider how to hook into sklearn.model class predict function, for generationg of alpha/etc up front
     - R gdm pkg:
         - FIGURE OUT HOW TO INSTALL!
         - either make it an optional dependency
@@ -68,7 +51,6 @@ TODO:
     - GDM fits getting assigned to the sim leaves only space for one, which
       doesn't facilitate comparing results; reconfigure this (perhaps just
       create GDM class to return results in and give it a plot fn?)
-    - figure out bug with alpha rast as function of env
     - prevent our f(Env) functions from being anchored at 0 on y-axis?
     - finalize input vs GDM-fitted f(Env) plotting issues
     - which is more justifiable, product of univariate normals or multivar normal?
@@ -287,23 +269,15 @@ class Species:
     '''
     def __init__(self,
                  niche: list[vectorlike],
-                 # TODO: DELETE
-                 #niche_cent: list[tuple],
                  max_poisson_lambda: float,
                  prob_detect: float,
                 ) -> None:
         # validate args
-        # TODO: DELETE
-        # assert len(niche) == len(niche_cent)
         for i in range(len(niche)):
             assert len(niche[i]) == 2 # mu and sigma
-            # TODO DELETE
-            #assert len(niche_cent[i]) == 2 # i and j cell coordinates
         assert prob_detect is None or 0 <= prob_detect <= 1
         # assign attributes
         self.niche = niche
-        # TODO DELETE
-        # self._niche_cent = niche_cent
         self.max_poisson_lambda = max_poisson_lambda
         self.prob_detect = prob_detect
 
@@ -316,7 +290,6 @@ class Sim:
                  env: List[rasterlike],
                  fenvs: list[Type[fEnv]],
                  gamma: int,
-                 alpha: Optional[raster_or_vectorlike] = None,
                  n_survey_sites: Optional[int] = None,
                  survey_sites: Optional[List[Tuple[float]]] = None,
                  min_niche_sigma: float = 0.001,
@@ -355,28 +328,6 @@ class Sim:
                         verbose=self._verbose,
                         debug=self._debug,
                        )
-        # TODO: DELETE alpha_coeffs and figure out how to handle None arg
-        if alpha is None:
-            self.alpha_coeffs = None
-            self.alpha_rast = None
-            self._alpha_probs = None
-        elif (isinstance(alpha, list) or
-              isinstance(alpha, tuple) or
-              (isinstance(alpha, np.ndarray) and len(alpha.shape) == 1)):
-            # multiply alpha coeffs by their layers of the environment, sum to a
-            # single raster, then self-normalize and melt
-            self.alpha_coeffs = alpha
-            self.alpha_rast = np.stack([_rescale_arr(c*e) for c,
-                    e in zip(self.alpha_coeffs, self.env)]).sum(axis=0)
-            self.alpha_rast = self.alpha_rast/np.sum(self.alpha_rast)
-            self._alpha_probs = self.alpha_rast.ravel()
-        elif ((isinstance(alpha, np.ndarray) and len(alpha.shape) == 2) or
-              isinstance(alpha, xr.core.dataarray.DataArray)):
-            self.alpha_coeffs = None
-            self.alpha_rast = np.array(alpha)
-            self._alpha_probs = self.alpha_rast.ravel()
-        else:
-            raise TypeError
         # make niche KDE
         self._make_niche_kde()
         # handle survey_sites
@@ -446,6 +397,9 @@ class Sim:
         env_changed = hasattr(self, 'env') and (not np.all(self.env == env))
         # convert environment to np.ndarray and store it
         self.env = np.array(env)
+        # add a depth-1 0th dimension, if env is just a single raster
+        if self._n_lyrs == 1:
+            self.env = self.env.reshape(-1, *self.env.shape)
         self._env_min_vals = [np.min(e) for e in self.env]
         self._env_max_vals = [np.max(e) for e in self.env]
         # set the environmetn's standard deviation, if doesn't yet exist and/or
@@ -462,7 +416,8 @@ class Sim:
                         kernel='gaussian',
                         bandwidth='scott',
                        ):
-        draw_cts = np.round(self.alpha_rast/np.min(self.alpha_rast), 0)-1
+        # got rid of failed alpha idea; just sampling whole environment evenly
+        draw_cts = np.ones(self.env[0].shape)
         assert np.all(draw_cts % 1 == 0)
         draw_lists = []
         for e in self.env:
@@ -484,28 +439,6 @@ class Sim:
         create a dict of all species' ecological niches
         (i.e., μ and σ values for all environmental layers)
         '''
-        # TODO DELETE
-        ## melt env rasters' vals too
-        #env_ravel = [e.ravel() for e in self.env]
-        ## (centers will always be a vector of values occurring on each of the
-        ## environmental layers in the landscape)
-        #spp_mus = []
-        ## will also store the (i, j) coordinates corresponding to the niche
-        ## centers on each axis
-        #i_inds, j_inds = [inds.ravel() for inds in np.indices(self._dims)]
-        #niche_cents = []
-        #mu_inds = []
-        #for sp in range(self.gamma):
-        #    mu_ind = np.random.choice(a=range(np.prod(self._dims)),
-        #                              p=self._alpha_probs,
-        #                             )
-        #    # save niche center
-        #    niche_cents.append([(i_inds[mu_ind],
-        #                           j_inds[mu_ind])] * self._n_lyrs)
-        #    spp_mus.append([e[mu_ind] for e in env_ravel])
-        #    mu_inds.append(mu_ind)
-        #self.mu_inds = mu_inds
-
         # draw species' niche centers from the niche KDE
         spp_mus = self._niche_kde.sample(self.gamma)
 
@@ -832,17 +765,6 @@ class Sim:
         plt.colorbar(img)
         ax.set_title('α-diversity at surveyed sites', size=14)
 
-        # plot input alpha raster
-        if self.alpha_rast is not None:
-            ax = fig.add_subplot(gs[50:, :30])
-            img = ax.imshow(self.alpha_rast,
-                            vmin=0,
-                            vmax=np.max(self.alpha_rast),
-                           )
-            plt.colorbar(img)
-            ax.set_title('expected α-diversity (scaled to [0,1])', size=14)
-
-
         # plot PCA rast from GDM transform
         ax = fig.add_subplot(gs[50:, 70:])
         self.gdm_pca_rast.plot.imshow(ax=ax)
@@ -882,8 +804,6 @@ class Sim:
         '''
         # get species' niche
         niche = self.spp[sp].niche
-        # TODO DELETE
-        #niche_cent = self.spp[sp]._niche_cent
         # calculate map of expected distribution
         expec = np.zeros(self.env[0, :, :].shape)
         # calculate presence probability at all cells
@@ -928,18 +848,6 @@ class Sim:
             ax.set_xticks(())
             ax.set_xticks(())
             plt.colorbar(img)
-            # plot niche center loc
-            # NOTE: (i, j) gets plotted (cent[0], cent[1]) for (x,y)
-            # TODO DELETE
-            #ax.scatter(niche_cent[i][1],
-            #           niche_cent[i][0],
-            #           marker='*',
-            #           s=35,
-            #           c='yellow',
-            #           edgecolor='black',
-            #           linewidth=0.25,
-            #           alpha=0.8,
-            #          )
             ax.set_title("$Env_%s$" % i, size=14)
         img = ax_expec.imshow(expec,
                               cmap=cmap,
@@ -957,19 +865,6 @@ class Sim:
         fig.subplots_adjust(hspace=0.25,
                             wspace=0.25,
                            )
-        # TODO DELETE
-        #for ax in [ax_expec, ax_obser]:
-            #for i in range(self._n_lyrs):
-                # NOTE: (i, j) gets plotted (cent[0], cent[1]) for (x,y)
-                #ax.scatter(niche_cent[i][1],
-                #           niche_cent[i][0],
-                #           marker='*',
-                #           s=35,
-                #           c='yellow',
-                #           edgecolor='black',
-                #           linewidth=0.25,
-                #           alpha=0.8,
-                #          )
         fig.show()
         if save:
            fig.savefig(f'comm_sim_sp{sp}_expec_vs_obser_distr.png',
@@ -1350,8 +1245,6 @@ ENV = [_rescale_arr(e, new_scale=fenv._x_minmax) for fenv, e in zip(FENV, ENV)]
 
 # params to determine 'inventory' diversities (a la Whittaker)
 GAMMA=2000
-#ALPHA = None
-ALPHA = [0.5, 1, 0.01]
 
 # species-species lambdas (for ~Pois distributions determining abundance)
 MAX_POISSON_LAMBDAS = None
@@ -1363,7 +1256,6 @@ DETECT_PROBS = None
 sim = Sim(env=ENV,
           fenvs=FENV,
           gamma=GAMMA,
-          alpha=ALPHA,
           n_survey_sites=None,
           survey_sites=None,
           min_niche_sigma=MIN_NICHE_SIGMA,
