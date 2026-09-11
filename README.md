@@ -6,7 +6,7 @@ A Python package for 'reverse-engineering' generalised dissimilarity modelling (
 to simulate communities distributed across variable landscapes,
 and then using a 'virtual ecologist' to simulate various observation processes on those communities.
 
-![overview](sim_comm_comp_design.png)
+![overview](img/sim_comm_comp_design.png)
 
 ## Overview
 
