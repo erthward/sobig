@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sobig"
+version = "0.1.0"
+description = "Simulation of observations of biodiversity across gradients."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Drew Terasaki Hart", email = "drew.terasaki.hart@gmail.com" }
+]
+dependencies = [
+  "numpy",
+  "pandas",
+  "numba",
+  "nlmpy",
+  "scikit-learn",
+  "dms-variants",
+  "scipy",
+  "matplotlib",
+  "rasterio",
+  "xarray",
+  "rioxarray",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "ruff>=0.6",
+  "build>=1.2",
+  "twine>=5",
+]
+
+[project.urls]
+Homepage = "https://github.com/erthward/sobig"
+Repository = "https://github.com/erthward/sobig"
+Issues = "https://github.com/erthward/sobig/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sobig"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

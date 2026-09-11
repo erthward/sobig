@@ -9,13 +9,17 @@ import dms_variants
 from scipy.stats import norm, multivariate_normal
 import matplotlib as mpl
 import matplotlib.pyplot as plt
-import os
+from importlib.resources import files, as_file
+import shutil
+import subprocess
+import warnings
 import time
 from math import comb
-import pandas as pd
 import rasterio as rio
 import xarray as xr
 import rioxarray as rxr
+
+from . import pygdm
 
 '''
 simulate community composition at any or all points in a simulated landscape
@@ -26,21 +30,12 @@ input parameters include:
     - spatial autocorrelation of each of those layers
     - knots and coefficients for functions defining the relationship between
       environmental and ecological turnover (i.e., f(Env) functions)
-    - an α-diversity layer (map of local species richness)
-      (defaults to a layer parameterized same as the first environmental layer)
     - γ-diversity (total species count on landscape)
 
 
 
-TODO:
-    - pick up with TODO: DELETE comments
-    - move other functions to methods of Sim
+NEXT STEPS:
     - add functionality for removing species (based on niche width/specialization or something like that)
-    - R gdm pkg:
-        - FIGURE OUT HOW TO INSTALL!
-        - either make it an optional dependency
-        - or figure out way to prep whole thing to be conda isntalled
-        - or port GDM to python?
     - add sampling function!
     - teaser scenarios:
         - show effects of sampling and sample site density on GAM richness model
@@ -71,6 +66,76 @@ numerical = Union[float, int]
 vectorlike = Union[List[numerical], Tuple[numerical], np.ndarray]
 rasterlike = Union[np.ndarray, xr.core.dataarray.DataArray]
 raster_or_vectorlike = Union[List[numerical], Tuple[numerical], np.ndarray, xr.core.dataarray.DataArray]
+
+
+#-----------------
+# helper functions
+#-----------------
+
+def _standardize_vec(vec: vectorlike):
+    '''
+    standardize a numerical vector-like object
+    '''
+    return (np.array(vec) - np.nanmean(vec))/np.nanstd(vec)
+
+
+def _rescale_arr(arr: Union[vectorlike, rasterlike],
+                 new_scale: Optional[vectorlike] = [0, 1],
+                 by_rast_band : bool = False,
+                ) -> Union[np.ndarray, xr.core.dataarray.DataArray]:
+    '''
+    linearly recast an array to a new interval (default: [0,1])
+    using min-max scaling, optionally by raster band (i.e., by index on axis 0;
+    defaults to rescaling the entire raster's set of values, regardless of axes)
+    '''
+    assert len(new_scale) == 2
+    new_range = new_scale[1] - new_scale[0]
+    assert new_range > 0
+    out = deepcopy(arr)
+    if by_rast_band:
+        assert len(out.shape) == 3
+        for i in range(out.shape[0]):
+            out[i] = (((out[i]-np.nanmin(out[i])) * new_range)/
+                       (np.nanmax(out[i])-np.nanmin(out[i]))) + new_scale[0]
+    else:
+        out = (((out-np.nanmin(out)) * new_range)/
+               (np.nanmax(out)-np.nanmin(out))) + new_scale[0]
+    return out
+
+
+def _standardize_arr(arr: Union[vectorlike, rasterlike],
+                     by_rast_band : bool = False,
+                    ) -> Union[np.ndarray, xr.core.dataarray.DataArray]:
+    '''
+    recast an array to the standard normal distribution (i.e., ~N(0, 1)),
+    optionally by raster band (i.e., along axis 0),
+    '''
+    out = deepcopy(arr)
+    if by_rast_band:
+        assert len(out.shape) == 3
+        for i in range(out.shape[0]):
+            out[i] = (out[i] - np.nanmean(out[i]))/np.nanstd(out[i])
+    else:
+        out = (out - np.nanmean(out))/np.nanstd(out)
+    return out
+
+
+
+def _calc_rarefaction_curve(N: int,
+                       comm: Dict[int, int],
+                       effort: float,
+                      ):
+    '''
+    calcuates n (sample size) and k (species richness of sample) as functions of
+    N (total community count), K (total species richness), N_i (count of each
+    species), and sampling effort (a measure constrained to the [0, 1] interval)
+
+        '''
+    assert N > 0
+    assert 0 <= effort <= 1
+    K = len(comm)
+    k = K - np.sum([N - comb(Ni, n) for Ni in comm.values()])/(comb(N, n))
+    return n, k
 
 
 #--------
@@ -336,7 +401,7 @@ class Sim:
                 # create a point for every raster cell, if n_survey_sites not
                 # specified
                 n_survey_sites = np.prod(self._dims)
-            survey_sites = _draw_random_survey_sites(self._dims, n_survey_sites)
+            survey_sites = self._draw_random_survey_sites(n_survey_sites)
         else:
             assert n_survey_sites is None, ("If survey_sites are provided "
                                             "then n_survey_sites must be None.")
@@ -495,13 +560,51 @@ class Sim:
                 # environmental layer
             # create and save the Species
             sp = Species(niche=niche,
-                         # TODO: DELETE
-                         #niche_cent=niche_cents[s],
                          max_poisson_lambda=max_poisson_lambdas[s],
                          prob_detect=detect_probs[s],
                         )
             spp[s] = sp
         self.spp = spp
+
+
+    def _sim_comm(self,
+                  i: float,
+                  j: float,
+                  max_prob_pres: float = 1.0,
+                  prob_pres_thresh_round_to_1: Optional[float] = None,
+                  use_multivar_normal: bool = False,
+                  debug: bool = False,
+                 ) -> Dict[int, int]:
+        '''
+        use the list of environmental layers provided and the dict of species
+        and their niches to simulate complete community composition at grid cell i,j
+        '''
+        # list to store all species present
+        survey = {}
+        # get environmental values at point grid cell i,j
+        # NOTE: site points sit at cell centers, so int() converts to their cell indices
+        env_vals = [e[int(i), int(j)] for e in self.env]
+        for s, sp in self.spp.items():
+            # calculate presence probability
+            prob = self._calc_pres_prob(env_vals,
+                                   sp.niche,
+                                   use_multivar_normal=self._use_multivar_normal_niche,
+                                   prob_pres_thresh_round_to_1=self._prob_pres_thresh_round_to_1,
+                                 )
+            # determine presence as a Bernoulli draw on that probability
+            # NOTE: ... treating all layers as independent, even though
+            #       in reality we could actually fold in cross-layer
+            #       correlation to account for chance non-independence between
+            #       environmental axes...)
+            # NOTE: ... we also ignore spatial autocorrelation of presence in real
+            #       species by ignoring any information about whether or not the
+            #       species has been determined present in proximal locations...
+            if np.random.binomial(1, prob):
+                # if present, draw abundance from Poisson
+                # NOTE: altogether, this models survey results as an
+                # environmentally conditional zero-inflated Poisson
+                survey[s] = np.random.poisson(prob * sp.max_poisson_lambda)
+        return survey
 
 
     def _sim_comms(self,
@@ -532,14 +635,12 @@ class Sim:
                 if verbose:
                     if ct%25 == 0:
                         print(f"\n\t{np.round(100*(ct/len(self.sites)), 1)}% complete...\n")
-                survey = _sim_comm(self.env,
-                                   self.spp,
-                                   i,
-                                   j,
-                                   use_multivar_normal=self._use_multivar_normal_niche,
-                                   prob_pres_thresh_round_to_1=self._prob_pres_thresh_round_to_1,
-                                   debug=debug,
-                                  )
+                survey = self._sim_comm(i,
+                                       j,
+                                       use_multivar_normal=self._use_multivar_normal_niche,
+                                       prob_pres_thresh_round_to_1=self._prob_pres_thresh_round_to_1,
+                                       debug=debug,
+                                      )
                 comms.append(survey)
                 ct+=1
                 # store the full communities
@@ -620,14 +721,220 @@ class Sim:
                     effort = efforts[i]
                 else:
                     effort = None
-                ob = _sim_sample(spp=self.spp,
-                                 comm=comm,
-                                 effort=effort,
-                                 by_rel_abund=by_rel_abund,
-                                 by_detect_prob=by_detect_prob,
-                                )
+                ob = self._sim_sample(comm=comm,
+                                      effort=effort,
+                                      by_rel_abund=by_rel_abund,
+                                      by_detect_prob=by_detect_prob,
+                                     )
                 obs.append(ob)
         return obs
+
+
+    def _draw_random_survey_sites(self,
+                                  n: int) -> List[Tuple[float]]:
+        '''
+        draw a set of random survey site points within a raster whose coordinates
+        range from 0 to dim-1 in both axes in dims; each point will be in a
+        separate pixel, so n must not exceed the number of pixels
+        '''
+        dims = self._dims
+        assert n > 0 and n <= np.prod(dims)
+        X, Y = np.meshgrid(range(dims[0]), range(dims[1]))
+        xs = X.ravel()
+        ys = Y.ravel()
+        pts = [*zip(xs, ys)]
+        np.random.shuffle(pts)
+        idxs = np.random.choice(range(len(pts)), replace=False, size=n)
+        # NOTE: add 0.5 to all site points, to place them in cell centers
+        rand_pts = [tuple(np.array(pts[idx])+0.5) for idx in idxs]
+        return rand_pts
+
+
+    def _calc_pres_prob(self,
+                        env_vals: vectorlike,
+                        niche: Tuple[float],
+                        use_multivar_normal: bool = False,
+                        prob_pres_thresh_round_to_1: Optional[float] = None,
+                       ) -> float:
+        '''
+        for a location described by the given environmental values,
+        calculate the probability of presence of a species with the given niche
+        '''
+        if not use_multivar_normal:
+            # list of probability densities extracted from the normal distributions
+            # describing the species' niches on each environmental axis
+            probs = []
+            for n, e in enumerate(env_vals):
+                # get probability of presence for this axis by determining the
+                # probability of drawing, from the species' niche distribution
+                # on this environmental axis, a value equally or more extreme
+                # than the survey position's environmental value
+                # NOTE: calculating and then subtracting difference between survey
+                #       location's environmental value and niche center, then
+                #       subtracting that from the niche center in the CDF
+                #       calculation, thus getting the probability of a value being
+                #       that far below the niche center; then multiply by two to
+                #       get two-tailed probability of a value as extreme or more so
+                diff = np.abs(e-niche[n][0])
+                prob_n = 2 * (norm.cdf(x=niche[n][0]-diff,
+                                       loc=niche[n][0],
+                                       scale=niche[n][1],
+                                      ))
+                assert 0 <= prob_n <= 1
+                probs.append(prob_n)
+            # determine overall probability of presence as the product of all
+            # probabilities (i.e., the joint probability across all
+            # environmental axes, treating the axes as if they are independent...
+            # NOTE: ... even though in reality we could actually fold in cross-layer
+            #       correlation to account for chance non-independence between
+            #       environmental axes...)
+            # NOTE: ... we also ignore spatial autocorrelation of presence in real
+            #       species by ignoring any information about whether or not the
+            #       species has been determined present in proximal locations...
+            prob = np.prod(probs)**(1/3)
+        else:
+            # get arrays of niche centers and niche widths
+            mus = np.array([n[0] for n in niche])
+            sigmas = np.array([n[1] for n in niche])
+            # construct covariance matrix (NOTE: without covariance between layers!)
+            covar = np.zeros([len(mus)]*2)
+            covar[np.diag_indices_from(covar)] = sigmas
+            # get probability of presence using the cumulative distribution
+            # function of the multivariate normal described by the species' niche
+            # distributions on all axes (modeled as the probability of drawing
+            # from within the species' multivariate normal niche space
+            # a series of environmental values equally extreme as or more extreme
+            # than the environmental values observed as the survey position)
+            # NOTE: calculating and then subtracting difference between survey
+            #       location's environmental values and multivariate niche center,
+            #       then subtracting that from the niche center in the CDF
+            #       calculation, thus getting the probability of a value being
+            #       that far below the niche center; then multiplying by two to
+            #       get the two-tailed probability of a value as extreme or more so)
+            diffs = np.abs(env_vals-mus)
+            distr = multivariate_normal(mean=mus, cov=covar, allow_singular=False)
+            prob = 2 * distr.cdf(x=mus-diffs)
+            assert 0 <= prob <= 1
+        # round values to 1 above a certain value, if required
+        if (prob_pres_thresh_round_to_1 is not None and
+            prob >= prob_pres_thresh_round_to_1):
+            prob = 1
+        return prob
+
+
+    def _sim_sample(self,
+                    comm: Dict[int, int],
+                    effort: Optional[float] = None,
+                    by_rel_abund: bool = True,
+                    by_detect_prob: bool = False,
+                   ) -> Dict[int, int]:
+        '''
+        simulate a sample of species observations from the community provided
+        using sampling arguments including effort (default to None, in which case
+        only a single 'opportunistic' sample is returned; otherwise constrained
+        to [0, 1]), and whether or not relative abundances and/or intrinsic
+        detection probabilities should influence species' observation probabilities
+        '''
+        # get total number of individuals in the whole community
+        N = np.sum([*comm.values()])
+        # copy the comm, for use as a counter object
+        counter = deepcopy(comm)
+        # create output object
+        sample = {}
+        # get vector of probs that a single sighting happens to be of each species
+        # (starts as all ones, then gets multiplied by needed values)
+        sp_probs = np.ones(len(comm))
+        # multiply by abundances, if relative abundance factors into sampling probs
+        if by_rel_abund:
+            sp_probs *= np.array([*comm.values()])
+        # mutliply by species intrinsic detection probabilities, if needed
+        if by_detect_prob:
+            sp_probs *= np.array([self.spp[sp].prob_detect for sp in comm.keys()])
+        # now normalize to proper probabilities, for use in np.random.choice
+        sp_probs = sp_probs/np.sum(sp_probs)
+        assert np.allclose(np.sum(sp_probs), 1)
+        # use effort and rarefaction to determine size of sample...
+        if effort is not None:
+            # NOTE: FOR NOW, ASSUMES SIMPLE LINEAR SCALING OF SAMPLE SIZE WITH EFFORT
+            n = int(np.round(N*effort, 0))
+        # ... or set it to 1, if effort is not provided and this is thus an
+        # 'opportunistic' sample
+        else:
+            n = 1
+        # loop over sample size, draw samp, and pop it from counter into sample
+        while np.sum([*sample.values()]) < n:
+            sp = np.random.choice([*comm.keys()], p=sp_probs)
+            if sp in counter:
+                counter[sp] -= 1
+                if counter[sp] == 0:
+                    del counter[sp]
+                if sp in sample:
+                    sample[sp] += 1
+                else:
+                    sample[sp] = 1
+            else:
+                pass
+        # check all counts are <= full count in comm
+        for sp in sample:
+            assert sample[sp] <= comm[sp]
+        # check total sample size is correct
+        assert np.sum([*sample.values()]) == n
+        if effort is None:
+            assert np.sum([*sample.values()]) == 1
+        return sample
+
+
+    def _prep_GDM_input_data(self,
+                             surveys: List[Dict[int, int]],
+                             bio_data_type: str = 'abund',
+                             site_survey_filename: str = 'site_survey.csv',
+                             env_rast_filename: str = 'env_rast.tif',
+                            ) -> None:
+        '''
+        prep a set of files to input into a basic R script for running a GDM model
+        '''
+        # create and save 'site-survey' table
+        # (sites in rows, species in columns)
+        n_spp = self.gamma
+        n_sites = len(surveys)
+        # NOTE: adding 3 to include a site column and x and y columns
+        add_cols = 3
+        site_surv_mat = np.zeros((n_sites, n_spp+add_cols))
+        # NOTE: add site column
+        site_surv_mat[:, 0] = [*range(len(surveys))]
+        for i, survey in enumerate(surveys):
+            # NOTE: adding x and y columns (sites are expressed as (i, j) matrix
+            #       indices, so flip them express as (x, y) geographic coordinates)
+            pt = self.sites[i]
+            site_surv_mat[i, 1] = pt[1]
+            site_surv_mat[i, 2] = pt[0]
+            for j, abund in survey.items():
+                if bio_data_type == 'abund':
+                    site_surv_mat[i, j+add_cols] = abund
+                elif bio_data_type == 'pres_abs':
+                    site_surv_mat[i, j+add_cols] = 1
+        site_surv_df = pd.DataFrame(site_surv_mat)
+        site_surv_df.columns = ['site', 'x', 'y'] + [f'spp{i}' for i in range(n_spp)]
+        site_surv_df.to_csv(site_survey_filename, index=False)
+        print("\nGDM SITES TABLE SAVED TO DISK.\n")
+        # create and save environmental raster
+        ydim, xdim = self.env.shape[1], self.env.shape[2]
+        n_bands = self.env.shape[0]
+        dtype = self.env.dtype
+        crs = 'EPSG:3857' # just a stand-in projected EPSG, to avoid CRS issues
+        transform = rio.transform.from_origin(0, ydim, 1, 1) # top-left corner
+        with rio.open(env_rast_filename,
+                      'w',
+                      driver='GTiff',
+                      height=ydim,
+                      width=xdim,
+                      count=n_bands,
+                      dtype=dtype,
+                      crs=crs,
+                      transform=transform) as dst:
+            for n in range(n_bands):
+                dst.write(self.env[n], n + 1)
+        print("\nGDM ENV RAST SAVED TO DISK.\n")
 
 
     def run_GDM(self,
@@ -641,41 +948,93 @@ class Sim:
                 plot_fenv_input: bool = True,
                 plot_title: str = '',
                 verbose: bool = False,
+                implementation: str = '_r', # NOTE: 'r' runs GDM using the Fitzpatrik
+                                            #       et al. code;
+                                            #       'py' runs GDM hastily ported to
+                                            #       Python by Claude (since I suddenly
+                                            #       stopped being able to install R's
+                                            #       'gdm' package and didn't feel like
+                                            #       wasting more time debugging), 
+                                            # which it's worth noting is much slower,
+                                            #       lacking the Cpp optimizer.
                ) -> None:
         '''
-        prep GDM data, save to disk, execute R script to run GDM,
-        then read in and return results
+        prep GDM data, save to disk if needed,
+        then execute either the R script to run GDM or the minimalist Python
+        port of it and return resulting ispline fits and PCA-transformed raster
         '''
         assert isinstance(gdm_data_type, str)
         assert gdm_data_type in ['abund', 'pres_abs']
+        assert implementation in ['r', 'py']
         print(f"\n\nRUNNING GDM...\n\n")
         # use the complete communities, if surveys were not provided
         if surveys is None:
             surveys = self.comms
         # prep and save GDM input data
-        _prep_GDM_input_data(gamma=self.gamma,
-                             surveys=surveys,
-                             survey_sites=self.sites,
-                             env=self.env,
-                             bio_data_type=gdm_data_type,
-                             site_survey_filename=site_survey_filename,
-                             env_rast_filename=env_rast_filename,
-                            )
-        # run R script
-        if gdm_data_type == 'abund':
-            abund = 'TRUE'
-        else:
-            abund = 'FALSE'
-        R_cmd = (f"Rscript --vanilla run_gdm.r {site_survey_filename} "
-                 f"{env_rast_filename} {abund} "
-                 f"{fits_filename} {pca_rast_filename}")
-        if verbose:
-            print(f"\tNOW RUNNING: > {R_cmd}\n")
-        os.system(R_cmd)
-        # read and return results
-        gdm_fits = pd.read_csv(fits_filename)
-        pca_rast = rxr.open_rasterio(pca_rast_filename)
-        # min-max scale raster (comes in as 0-255)
+        self._prep_GDM_input_data(surveys=surveys,
+                                  bio_data_type=gdm_data_type,
+                                  site_survey_filename=site_survey_filename,
+                                  env_rast_filename=env_rast_filename,
+                                 )
+        if implementation == 'r':
+            if shutil.which("Rscript") is None:
+                warnings.warn("Rscript was not found on the system. "
+                              "Skipping GDM analysis. Please ensure R is installed and "
+                              "Rscript is available on your PATH.\n"
+                              "Meanwhile, defaulting to slower Python implementation of GDM.",
+                              RuntimeWarning,
+                             )
+                implementation = 'py'
+        if implementation == 'r':
+            # run R script
+            if gdm_data_type == 'abund':
+                abund = 'TRUE'
+            else:
+                abund = 'FALSE'
+
+            r_script = files("sobig").joinpath("r", "run_gdm.R")
+            with as_file(r_script) as script_path:
+                R_cmd = ["Rscript",
+                         "--vanilla",
+                         r_script,
+                         site_survey_filename,
+                         env_rast_filename,
+                         abund,
+                         fits_filename,
+                         pca_rast_filename,
+                        ]
+                if verbose:
+                    print(f"\tNOW RUNNING: > {R_cmd}\n")
+                result = subprocess.run(R_cmd,
+                                        capture_output=True,
+                                        text=True,
+                                       )
+            if result.returncode != 0:
+                warnings.warn("The R GDM analysis failed. "
+                              "This may indicate that R and/or the R 'gdm' package "
+                              "are not properly installed.\n"
+                              f"R output:\n{result.stderr}\n"
+                              "Meanwhile, defaulting to slower Python implementation of GDM.",
+                              RuntimeWarning,
+                             )
+                implementation = 'py'
+            else:
+                # read and return results
+                gdm_fits = pd.read_csv(fits_filename)
+                pca_rast = rxr.open_rasterio(pca_rast_filename)
+        if implementation == 'py':
+            site_survey_df = pd.read_csv(site_survey_filename)
+            env_rast = rxr.open_rasterio(env_rast_filename)
+            gdm_fits, pca_rast = pygdm.run_gdm(site_table=site_survey_df,
+                                               env_raster=env_rast,
+                                               abund=gdm_data_type=='abund',
+                                               geo=False,
+                                               n_splines=3,
+                                               curve_points=200,
+                                               max_iter=100,
+                                              )
+        # min-max scale raster (comes in as 0-255 from R, or centered on 0 from
+        # py implementation)
         pca_rast_rescaled = _rescale_arr(pca_rast, by_rast_band=True)
         # save the output GDM fits and raster to their Sim attributes
         self.gdm_fits = gdm_fits
@@ -809,7 +1168,7 @@ class Sim:
         # calculate presence probability at all cells
         for i in range(self.env[0, :, :].shape[0]):
             for j in range(self.env[0, :, :].shape[1]):
-                prob = _calc_pres_prob(env_vals=[e[i, j] for e in self.env],
+                prob = self._calc_pres_prob(env_vals=[e[i, j] for e in self.env],
                                        niche=self.spp[sp].niche,
                                        use_multivar_normal=self._use_multivar_normal_niche,
                                        prob_pres_thresh_round_to_1=self._prob_pres_thresh_round_to_1,
@@ -872,480 +1231,115 @@ class Sim:
                        )
 
 
-#----------
-# functions
-#----------
-
-def _standardize_vec(vec: vectorlike):
-    '''
-    standardize a numerical vector-like object
-    '''
-    return (np.array(vec) - np.nanmean(vec))/np.nanstd(vec)
-
-
-def _rescale_arr(arr: Union[vectorlike, rasterlike],
-                 new_scale: Optional[vectorlike] = [0, 1],
-                 by_rast_band : bool = False,
-                ) -> Union[np.ndarray, xr.core.dataarray.DataArray]:
-    '''
-    linearly recast an array to a new interval (default: [0,1])
-    using min-max scaling, optionally by raster band (i.e., by index on axis 0;
-    defaults to rescaling the entire raster's set of values, regardless of axes)
-    '''
-    assert len(new_scale) == 2
-    new_range = new_scale[1] - new_scale[0]
-    assert new_range > 0
-    out = deepcopy(arr)
-    if by_rast_band:
-        assert len(out.shape) == 3
-        for i in range(out.shape[0]):
-            out[i] = (((out[i]-np.nanmin(out[i])) * new_range)/
-                       (np.nanmax(out[i])-np.nanmin(out[i]))) + new_scale[0]
-    else:
-        out = (((out-np.nanmin(out)) * new_range)/
-               (np.nanmax(out)-np.nanmin(out))) + new_scale[0]
-    return out
-
-
-def _standardize_arr(arr: Union[vectorlike, rasterlike],
-                     by_rast_band : bool = False,
-                    ) -> Union[np.ndarray, xr.core.dataarray.DataArray]:
-    '''
-    recast an array to the standard normal distribution (i.e., ~N(0, 1)),
-    optionally by raster band (i.e., along axis 0),
-    '''
-    out = deepcopy(arr)
-    if by_rast_band:
-        assert len(out.shape) == 3
-        for i in range(out.shape[0]):
-            out[i] = (out[i] - np.nanmean(out[i]))/np.nanstd(out[i])
-    else:
-        out = (out - np.nanmean(out))/np.nanstd(out)
-    return out
-
-
-def _draw_random_survey_sites(dims: Tuple[Union[float, int]],
-                             n: int) -> List[Tuple[float]]:
-    '''
-    draw a set of random survey site points within a raster whose coordinates
-    range from 0 to dim-1 in both axes in dims; each point will be in a
-    separate pixel, so n must not exceed the number of pixels
-    '''
-    assert n > 0 and n <= np.prod(dims)
-    X, Y = np.meshgrid(range(dims[0]), range(dims[1]))
-    xs = X.ravel()
-    ys = Y.ravel()
-    pts = [*zip(xs, ys)]
-    np.random.shuffle(pts)
-    idxs = np.random.choice(range(len(pts)), replace=False, size=n)
-    # NOTE: add 0.5 to all site points, to place them in cell centers
-    rand_pts = [tuple(np.array(pts[idx])+0.5) for idx in idxs]
-    return rand_pts
-
-
-
-def _calc_pres_prob(env_vals: vectorlike,
-                   niche: Tuple[float],
-                   use_multivar_normal: bool = False,
-                   prob_pres_thresh_round_to_1: Optional[float] = None,
-                  ) -> float:
-    '''
-    for a location described by the given environmental values,
-    calculate the probability of presence of a species with the given niche
-    '''
-    if not use_multivar_normal:
-        # list of probability densities extracted from the normal distributions
-        # describing the species' niches on each environmental axis
-        probs = []
-        for n, e in enumerate(env_vals):
-            # get probability of presence for this axis by determining the
-            # probability of drawing, from the species' niche distribution
-            # on this environmental axis, a value equally or more extreme
-            # than the survey position's environmental value
-            # NOTE: calculating and then subtracting difference between survey
-            #       location's environmental value and niche center, then
-            #       subtracting that from the niche center in the CDF
-            #       calculation, thus getting the probability of a value being
-            #       that far below the niche center; then multiply by two to
-            #       get two-tailed probability of a value as extreme or more so
-            diff = np.abs(e-niche[n][0])
-            prob_n = 2 * (norm.cdf(x=niche[n][0]-diff,
-                                   loc=niche[n][0],
-                                   scale=niche[n][1],
-                                  ))
-            assert 0 <= prob_n <= 1
-            probs.append(prob_n)
-        # determine overall probability of presence as the product of all
-        # probabilities (i.e., the joint probability across all
-        # environmental axes, treating the axes as if they are independent...
-        # NOTE: ... even though in reality we could actually fold in cross-layer
-        #       correlation to account for chance non-independence between
-        #       environmental axes...)
-        # NOTE: ... we also ignore spatial autocorrelation of presence in real
-        #       species by ignoring any information about whether or not the
-        #       species has been determined present in proximal locations...
-        prob = np.prod(probs)**(1/3)
-    else:
-        # get arrays of niche centers and niche widths
-        mus = np.array([n[0] for n in niche])
-        sigmas = np.array([n[1] for n in niche])
-        # construct covariance matrix (NOTE: without covariance between layers!)
-        covar = np.zeros([len(mus)]*2)
-        covar[np.diag_indices_from(covar)] = sigmas
-        # get probability of presence using the cumulative distribution
-        # function of the multivariate normal described by the species' niche
-        # distributions on all axes (modeled as the probability of drawing
-        # from within the species' multivariate normal niche space
-        # a series of environmental values equally extreme as or more extreme
-        # than the environmental values observed as the survey position)
-        # NOTE: calculating and then subtracting difference between survey
-        #       location's environmental values and multivariate niche center,
-        #       then subtracting that from the niche center in the CDF
-        #       calculation, thus getting the probability of a value being
-        #       that far below the niche center; then multiplying by two to
-        #       get the two-tailed probability of a value as extreme or more so)
-        diffs = np.abs(env_vals-mus)
-        distr = multivariate_normal(mean=mus, cov=covar, allow_singular=False)
-        prob = 2 * distr.cdf(x=mus-diffs)
-        assert 0 <= prob <= 1
-    # round values to 1 above a certain value, if required
-    if (prob_pres_thresh_round_to_1 is not None and
-        prob >= prob_pres_thresh_round_to_1):
-        prob = 1
-    return prob
-
-
-def _sim_comm(env: rasterlike,
-              spp: Dict[int, Species],
-              i: float,
-              j: float,
-              max_prob_pres: float = 1.0,
-              prob_pres_thresh_round_to_1: Optional[float] = None,
-              use_multivar_normal: bool = False,
-              debug: bool = False,
-             ) -> Dict[int, int]:
-    '''
-    use the list of environmental layers provided and the dict of species
-    and their niches to simulate complete community composition at grid cell i,j
-    '''
-    # list to store all species present
-    survey = {}
-    # get environmental values at point grid cell i,j
-    # NOTE: site points sit at cell centers, so int() converts to their cell indices
-    env_vals = [e[int(i), int(j)] for e in env]
-    for s, sp in spp.items():
-        # calculate presence probability
-        prob = _calc_pres_prob(env_vals,
-                               sp.niche,
-                               use_multivar_normal=use_multivar_normal,
-                               prob_pres_thresh_round_to_1=prob_pres_thresh_round_to_1,
-                             )
-        # determine presence as a Bernoulli draw on that probability
-        # NOTE: ... treating all layers as independent, even though
-        #       in reality we could actually fold in cross-layer
-        #       correlation to account for chance non-independence between
-        #       environmental axes...)
-        # NOTE: ... we also ignore spatial autocorrelation of presence in real
-        #       species by ignoring any information about whether or not the
-        #       species has been determined present in proximal locations...
-        if np.random.binomial(1, prob):
-            # if present, draw abundance from Poisson
-            # NOTE: altogether, this models survey results as an
-            # environmentally conditional zero-inflated Poisson
-            survey[s] = np.random.poisson(prob * sp.max_poisson_lambda)
-    return survey
-
-
-def _calc_rarefaction_curve(N: int,
-                       comm: Dict[int, int],
-                       effort: float,
-                      ):
-    '''
-    calcuates n (sample size) and k (species richness of sample) as functions of
-    N (total community count), K (total species richness), N_i (count of each
-    species), and sampling effort (a measure constrained to the [0, 1] interval)
-
-        '''
-    assert N > 0
-    assert 0 <= effort <= 1
-    K = len(comm)
-    k = K - np.sum([N - comb(Ni, n) for Ni in comm.values()])/(comb(N, n))
-    return n, k
-
-
-def _sim_sample(spp: Dict[int, Species],
-                comm: Dict[int, int],
-                effort: Optional[float] = None,
-                by_rel_abund: bool = True,
-                by_detect_prob: bool = False,
-               ) -> Dict[int, int]:
-    '''
-    simulate a sample of species observations from the community provided
-    using sampling arguments including effort (default to None, in which case
-    only a single 'opportunistic' sample is returned; otherwise constrained
-    to [0, 1]), and whether or not relative abundances and/or intrinsic
-    detection probabilities should influence species' observation probabilities
-    '''
-    # get total number of individuals in the whole community
-    N = np.sum([*comm.values()])
-    # copy the comm, for use as a counter object
-    counter = deepcopy(comm)
-    # create output object
-    sample = {}
-    # get vector of probs that a single sighting happens to be of each species
-    # (starts as all ones, then gets multiplied by needed values)
-    sp_probs = np.ones(len(comm))
-    # multiply by abundances, if relative abundance factors into sampling probs
-    if by_rel_abund:
-        sp_probs *= np.array([*comm.values()])
-    # mutliply by species intrinsic detection probabilities, if needed
-    if by_detect_prob:
-        sp_probs *= np.array([spp[sp].prob_detect for sp in comm.keys()])
-    # now normalize to proper probabilities, for use in np.random.choice
-    sp_probs = sp_probs/np.sum(sp_probs)
-    assert np.allclose(np.sum(sp_probs), 1)
-    # use effort and rarefaction to determine size of sample...
-    if effort is not None:
-        # NOTE: FOR NOW, ASSUMES SIMPLE LINEAR SCALING OF SAMPLE SIZE WITH EFFORT
-        n = int(np.round(N*effort, 0))
-    # ... or set it to 1, if effort is not provided and this is thus an
-    # 'opportunistic' sample
-    else:
-        n = 1
-    # loop over sample size, draw samp, and pop it from counter into sample
-    while np.sum([*sample.values()]) < n:
-        sp = np.random.choice([*comm.keys()], p=sp_probs)
-        if sp in counter:
-            counter[sp] -= 1
-            if counter[sp] == 0:
-                del counter[sp]
-            if sp in sample:
-                sample[sp] += 1
-            else:
-                sample[sp] = 1
-        else:
-            pass
-    # check all counts are <= full count in comm
-    for sp in sample:
-        assert sample[sp] <= comm[sp]
-    # check total sample size is correct
-    assert np.sum([*sample.values()]) == n
-    if effort is None:
-        assert np.sum([*sample.values()]) == 1
-    return sample
-
-
-
-def _prep_GDM_input_data(gamma: int,
-                         surveys: List[Dict[int, int]],
-                         survey_sites: List[Tuple[float]],
-                         env: rasterlike,
-                         bio_data_type: str = 'abund',
-                         site_survey_filename: str = 'site_survey.csv',
-                         env_rast_filename: str = 'env_rast.tif',
-                        ) -> None:
-    '''
-    prep a set of files to input into a basic R script for running a GDM model
-    '''
-    # create and save 'site-survey' table
-    # (sites in rows, species in columns)
-    n_spp = gamma
-    n_sites = len(surveys)
-    # NOTE: adding 3 to include a site column and x and y columns
-    add_cols = 3
-    site_surv_mat = np.zeros((n_sites, n_spp+add_cols))
-    # NOTE: add site column
-    site_surv_mat[:, 0] = [*range(len(surveys))]
-    for i, survey in enumerate(surveys):
-        # NOTE: adding x and y columns (sites are expressed as (i, j) matrix
-        #       indices, so flip them express as (x, y) geographic coordinates)
-        pt = survey_sites[i]
-        site_surv_mat[i, 1] = pt[1]
-        site_surv_mat[i, 2] = pt[0]
-        for j, abund in survey.items():
-            if bio_data_type == 'abund':
-                site_surv_mat[i, j+add_cols] = abund
-            elif bio_data_type == 'pres_abs':
-                site_surv_mat[i, j+add_cols] = 1
-    site_surv_df = pd.DataFrame(site_surv_mat)
-    site_surv_df.columns = ['site', 'x', 'y'] + [f'spp{i}' for i in range(gamma)]
-    site_surv_df.to_csv(site_survey_filename, index=False)
-    # create and save environmental raster
-    ydim, xdim = env.shape[1], env.shape[2]
-    n_bands = env.shape[0]
-    dtype = env.dtype
-    crs = 'EPSG:3857' # just a stand-in projected EPSG, to avoid CRS issues
-    transform = rio.transform.from_origin(0, ydim, 1, 1) # top-left corner
-    with rio.open(env_rast_filename,
-                  'w',
-                  driver='GTiff',
-                  height=ydim,
-                  width=xdim,
-                  count=n_bands,
-                  dtype=dtype,
-                  crs=crs,
-                  transform=transform) as dst:
-        for n in range(n_bands):
-            dst.write(env[n], n + 1)
-    print("\nGDM INPUTS SAVED TO DISK.\n")
-
-
-
-
-####################
-# SET PARAMS AND RUN
-####################
-# behavioral params
-VERBOSE = True
-DEBUG = True
-TIMEIT = True
-PLOT_IT = True
-SAVEPLOTS = True
-
-USE_MULTIVAR_NORMAL_NICHE = False
-MIN_NICHE_SIGMA = 0.01
-MAX_NICHE_SIGMA = 1.5
-PROB_PRES_THRESH_ROUND_TO_1 = None
-MAX_POISSON_LAMBDA_ACROSS_SPP = 1000
-GDM_DATA_TYPE = 'abund'
-
-SEED = 2
-if SEED is not None:
-    np.random.seed(SEED)
-
-# knots and coeffs for f(Env)
-knots = ([-1.5, -1, 0, 1, 1.5],
-         [-1.3, -0.2, 0.2, 1.1, 1.3],
-         [0, 10, 90, 100],
-        )
-coeffs = ([1, 1.5, 2, 2.5, 3, 0],
-          [0.1, 0.2, 0, 0.2, 6, 0],
-          [0.1, 0.1, 0.1, 0.1, 0],
-         )
-FENV = [fEnv(id=i, knots=k, coeffs=c) for i, (k, c) in enumerate(zip(knots,
-                                                                     coeffs))]
-
-# landscape params
-DIMS = (50, 50)
-ENV_H = (0.5, 0.5, 0.5)
-ADD_NOISE = True
-dist_source = np.zeros(DIMS)
-dist_source[int(DIMS[0]/2-1):int(DIMS[0]/2+1),
-            int(DIMS[1]/2-1):int(DIMS[1]/2+1)] = 1
-ENV = [nlmpy.edgeGradient(nRow=DIMS[0], nCol=DIMS[1], direction=0),
-       nlmpy.edgeGradient(nRow=DIMS[0], nCol=DIMS[1], direction=90),
-       nlmpy.distanceGradient(dist_source),
-      ]
-if ADD_NOISE:
-    NOISE = [nlmpy.mpd(nRow=DIMS[0], nCol=DIMS[1], h=h) for h in ENV_H]
-    ENV = [nlmpy.blendArrays([e, n]) for e, n in zip(ENV, NOISE)]
-# rescale to a normal centered on 0
-ENV = [_rescale_arr(e, new_scale=fenv._x_minmax) for fenv, e in zip(FENV, ENV)]
-
-
-# params to determine 'inventory' diversities (a la Whittaker)
-GAMMA=2000
-
-# species-species lambdas (for ~Pois distributions determining abundance)
-MAX_POISSON_LAMBDAS = None
-
-# detection probability vector (or None, to have randomly assigned)
-DETECT_PROBS = None
-
-# create the simulator
-sim = Sim(env=ENV,
-          fenvs=FENV,
-          gamma=GAMMA,
-          n_survey_sites=None,
-          survey_sites=None,
-          min_niche_sigma=MIN_NICHE_SIGMA,
-          max_niche_sigma=MAX_NICHE_SIGMA,
-          use_multivar_normal_niche=USE_MULTIVAR_NORMAL_NICHE,
-          prob_pres_thresh_round_to_1=PROB_PRES_THRESH_ROUND_TO_1,
-          max_poisson_lambda_across_spp=MAX_POISSON_LAMBDA_ACROSS_SPP,
-          max_poisson_lambdas=MAX_POISSON_LAMBDAS,
-          detect_probs=DETECT_PROBS,
-          verbose=VERBOSE,
-          debug=DEBUG,
-          timeit=TIMEIT,
-         )
-assert False
-# run GDM on full communities
-sim.run_GDM(surveys=None)
-
-# plot and save results
-sim.plot(scatter_survey_sites=False,
-         plot_fenv_input=False,
-         title='before change',
-         save=True,
-        )
-# plot expected vs. observed distribution for random species
-sp = [9, 10, 16]
-for s in sp:
-    sim.plot_expec_vs_obser_distr(sp=s,
-                                  title=f"before change: sp {s}",
-                                  cmap='viridis',
-                                  save=True,
-                                 )
-
-# deepcopy sim (just in case)
-sim_b4 = deepcopy(sim)
-
-# update the environment to simulate environmental change, then rerun the
-# same set of GDM results
-increase = nlmpy.mpd(50, 50, 1)*0.8
-ENV[1] = ENV[1] + increase
-sim.update_env(ENV)
-sim.run_GDM(surveys=None)
-# plot again
-sim.plot(scatter_survey_sites=False,
-         plot_fenv_input=False,
-         title='after change',
-         save=True,
-        )
-
-# plot expected vs. observed distribution for random species
-sp = [9, 10, 16]
-for s in sp:
-    sim.plot_expec_vs_obser_distr(sp=s,
-                                  title=f"before change: sp {s}",
-                                  cmap='viridis',
-                                  save=True,
-                                 )
-
-
-
-
-
-## compare GDM results for:
-#             # 1. complete community data
-#scenarios = [{'scheme': 'perfect'},
-#             # 2. abundance- and detectability-weighted surveys of 0.5 effort
-#            {'scheme': 'sample',
-#             'efforts': np.ones((sim.n_sites))*0.02,
-#             'by_rel_abund': True,
-#             'by_detect_prob': True,
-#            },
-#             # 3. abundance- and detectability-weighted surveys of variable effort
-#           #  {'scheme': 'sample',
-#           #   'efforts': np.random.uniform(0, 1, sim.n_sites),
-#           #   'by_rel_abund': True,
-#           #   'by_detect_prob': True,
-#           #  },
-#            ]
-#for scenario, plot_title in zip(scenarios, ['complete',
-#                                            'even effort',
-#                                            'variable effort',
-#                                           ]):
-#    obs = sim.sim_obs(**scenario)
-#    sim.run_GDM(surveys=obs,
-#                plot_it=True,
-#                plot_fenv_input=False,
-#                plot_title=plot_title,
-#               )
-#
-#
-
-
-
+def run_demo(seed=2,
+             use_env_change=False,
+             gdm_implementation='r',
+            ):
+    """
+    run a simple demo of sobig's functionality
+    """
+    # behavioral params
+    VERBOSE = True
+    DEBUG = True
+    TIMEIT = True
+    PLOT_IT = True
+    SAVEPLOTS = True
+    USE_MULTIVAR_NORMAL_NICHE = False
+    MIN_NICHE_SIGMA = 0.01
+    MAX_NICHE_SIGMA = 1.5
+    PROB_PRES_THRESH_ROUND_TO_1 = None
+    MAX_POISSON_LAMBDA_ACROSS_SPP = 1000
+    GDM_DATA_TYPE = 'abund'
+    if seed is not None:
+        np.random.seed(seed)
+    # knots and coeffs for f(Env)
+    knots = ([-1.5, -1, 0, 1, 1.5],
+             [-1.3, -0.2, 0.2, 1.1, 1.3],
+             [0, 10, 90, 100],
+            )
+    coeffs = ([1, 1.5, 2, 2.5, 3, 0],
+              [0.1, 0.2, 0, 0.2, 6, 0],
+              [0.1, 0.1, 0.1, 0.1, 0],
+             )
+    FENV = [fEnv(id=i, knots=k, coeffs=c) for i, (k, c) in enumerate(zip(knots,
+                                                                         coeffs))]
+    # landscape params
+    DIMS = (10, 10)
+    ENV_H = (0.5, 0.5, 0.5)
+    ADD_NOISE = True
+    dist_source = np.zeros(DIMS)
+    dist_source[int(DIMS[0]/2-1):int(DIMS[0]/2+1),
+                int(DIMS[1]/2-1):int(DIMS[1]/2+1)] = 1
+    ENV = [nlmpy.edgeGradient(nRow=DIMS[0], nCol=DIMS[1], direction=0),
+           nlmpy.edgeGradient(nRow=DIMS[0], nCol=DIMS[1], direction=90),
+           nlmpy.distanceGradient(dist_source),
+          ]
+    if ADD_NOISE:
+        NOISE = [nlmpy.mpd(nRow=DIMS[0], nCol=DIMS[1], h=h) for h in ENV_H]
+        ENV = [nlmpy.blendArrays([e, n]) for e, n in zip(ENV, NOISE)]
+    # rescale to a normal centered on 0
+    ENV = [_rescale_arr(e, new_scale=fenv._x_minmax) for fenv, e in zip(FENV, ENV)]
+    # params to determine 'inventory' diversities (a la Whittaker)
+    GAMMA=2000
+    # species-species lambdas (for ~Pois distributions determining abundance)
+    MAX_POISSON_LAMBDAS = None
+    # detection probability vector (or None, to have randomly assigned)
+    DETECT_PROBS = None
+    # create the simulator
+    sim = Sim(env=ENV,
+              fenvs=FENV,
+              gamma=GAMMA,
+              n_survey_sites=None,
+              survey_sites=None,
+              min_niche_sigma=MIN_NICHE_SIGMA,
+              max_niche_sigma=MAX_NICHE_SIGMA,
+              use_multivar_normal_niche=USE_MULTIVAR_NORMAL_NICHE,
+              prob_pres_thresh_round_to_1=PROB_PRES_THRESH_ROUND_TO_1,
+              max_poisson_lambda_across_spp=MAX_POISSON_LAMBDA_ACROSS_SPP,
+              max_poisson_lambdas=MAX_POISSON_LAMBDAS,
+              detect_probs=DETECT_PROBS,
+              verbose=VERBOSE,
+              debug=DEBUG,
+              timeit=TIMEIT,
+             )
+    # run GDM on full communities
+    sim.run_GDM(surveys=None, implementation=gdm_implementation)
+    # plot and save results
+    sim.plot(scatter_survey_sites=False,
+             plot_fenv_input=False,
+             title='before change',
+             save=True,
+            )
+    # plot expected vs. observed distribution for random species
+    sp = [0]
+    for s in sp:
+        sim.plot_expec_vs_obser_distr(sp=s,
+                                      title=f"before change: sp {s}",
+                                      cmap='viridis',
+                                      save=True,
+                                     )
+    # deepcopy sim (just in case)
+    sim_b4 = deepcopy(sim)
+    if use_env_change:
+        # update the environment to simulate environmental change, then rerun the
+        # same set of GDM results
+        increase = nlmpy.mpd(50, 50, 1)*0.8
+        ENV[1] = ENV[1] + increase
+        sim.update_env(ENV)
+        sim.run_GDM(surveys=None, implementation=gdm_implementation)
+        # plot again
+        sim.plot(scatter_survey_sites=False,
+                 plot_fenv_input=False,
+                 title='after change',
+                 save=True,
+                )
+        # plot expected vs. observed distribution for random species
+        sp = [0]
+        for s in sp:
+            sim.plot_expec_vs_obser_distr(sp=s,
+                                          title=f"before change: sp {s}",
+                                          cmap='viridis',
+                                          save=True,
+                                         )
+    return sim
 
