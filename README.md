@@ -1,6 +1,6 @@
 # SOBiG!
 
-##**S**imulation of **O**bservations of **Bi**odiversity across **G**radients
+### **S**imulation of **O**bservations of **Bi**odiversity across **G**radients
 
 A Python package for 'reverse-engineering' generalised dissimilarity modelling (GDM)
 to simulate communities distributed across variable landscapes,

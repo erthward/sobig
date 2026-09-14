@@ -4,10 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sobig"
-version = "0.1.1"
+version = "0.1.3"
 description = "Simulation of observations of biodiversity across gradients."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 license = { file = "LICENSE" }
 authors = [
   { name = "Drew Terasaki Hart", email = "drew.terasaki.hart@gmail.com" }
@@ -17,7 +17,7 @@ dependencies = [
   "pandas",
   "numba",
   "nlmpy",
-  "scikit-learn",
+  "scikit-learn>=1.2",
   "dms-variants",
   "scipy",
   "matplotlib",
