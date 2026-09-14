@@ -889,8 +889,8 @@ class Sim:
     def _prep_GDM_input_data(self,
                              surveys: List[Dict[int, int]],
                              bio_data_type: str = 'abund',
-                             site_survey_filename: str = 'site_survey.csv',
-                             env_rast_filename: str = 'env_rast.tif',
+                             site_survey_filename: str = 'sobig_site_survey.csv',
+                             env_rast_filename: str = 'sobig_env_rast.tif',
                             ) -> None:
         '''
         prep a set of files to input into a basic R script for running a GDM model
@@ -942,10 +942,11 @@ class Sim:
     def run_GDM(self,
                 surveys: Optional[List[Dict[int, int]]] = None,
                 gdm_data_type: str = 'abund',
-                site_survey_filename: str = 'site_survey.csv',
-                env_rast_filename: str = 'env_rast.tif',
-                fits_filename: str = 'GDM_fits.csv',
-                pca_rast_filename: str = 'GDM_env_rast_PCA.tif',
+                site_survey_filename: str = 'sobig_site_survey.csv',
+                env_rast_filename: str = 'sobig_env_rast.tif',
+                delete_intermed_files: bool = False,
+                fits_filename: str = 'sobig_GDM_fits.csv',
+                pca_rast_filename: str = 'sobig_GDM_env_rast_PCA.tif',
                 plot_it: bool = False,
                 plot_fenv_input: bool = True,
                 plot_title: str = '',
@@ -1060,6 +1061,10 @@ class Sim:
                      title=plot_title,
                      save=False,
                     )
+        # delete intermediate files, if indicated
+        if delete_intermed_files:
+            os.remove(site_survey_filename)
+            os.remove(env_rast_filename)
         return gdm_fits, pca_rast_rescaled
 
 
@@ -1318,7 +1323,12 @@ def run_demo(seed=2,
               timeit=TIMEIT,
              )
     # run GDM on full communities
-    sim.run_GDM(surveys=None, implementation=gdm_implementation)
+    sim.run_GDM(surveys=None,
+                implementation=gdm_implementation,
+                site_survey_filename: str = 'sobig_demo_site_survey.csv',
+                env_rast_filename: str = 'sobig_demo_env_rast.tif',
+                delete_intermed_files=True,
+               )
     # plot and save results
     fig = sim.plot(scatter_survey_sites=False,
                    plot_fenv_input=True,
@@ -1346,7 +1356,12 @@ def run_demo(seed=2,
         increase = nlmpy.mpd(50, 50, 1)*0.8
         ENV[1] = ENV[1] + increase
         sim.update_env(ENV)
-        sim.run_GDM(surveys=None, implementation=gdm_implementation)
+        sim.run_GDM(surveys=None,
+                    implementation=gdm_implementation,
+                    site_survey_filename: str = 'sobig_demo_site_survey.csv',
+                    env_rast_filename: str = 'sobig_demo_env_rast.tif',
+                   delete_intermed_files=True,
+                   )
         # plot again
         fig = sim.plot(scatter_survey_sites=False,
                        plot_fenv_input=True,
