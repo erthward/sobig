@@ -9,6 +9,7 @@ import dms_variants
 from scipy.stats import norm, multivariate_normal
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+from matplotlib.axes import Axes
 from importlib.resources import files, as_file
 import shutil
 import subprocess
@@ -31,7 +32,6 @@ input parameters include:
     - knots and coefficients for functions defining the relationship between
       environmental and ecological turnover (i.e., f(Env) functions)
     - γ-diversity (total species count on landscape)
-
 
 
 NEXT STEPS:
@@ -309,16 +309,18 @@ class fEnv:
                     y_plot,
                     ':',
                     label='input',
-                    linewidth=2,
-                    color='blue'
+                    linewidth=1.0,
+                    color='black',
+                    linestyle='-',
                    )
         if self.x_gdm_fit is not None and self.y_gdm_fit is not None:
             ax.plot(self.x_gdm_fit,
                     self.y_gdm_fit,
                     '-',
                     label='GDM fit',
-                    linewidth=2,
-                    color='black',
+                    linewidth=1.0,
+                    color='red',
+                    linestyle=':',
                     alpha=0.5,
                    )
         ax.set_xlabel("$Env_%i$" % self.id)
@@ -1112,7 +1114,7 @@ class Sim:
             ax.set_ylim(0, fenv_ax_max_ylim)
 
         # plot raster of observed alpha values at all surveyed cells
-        ax = fig.add_subplot(gs[50:, 35:65])
+        ax = fig.add_subplot(gs[50:, :30])
         survey_len_arr = np.ones(self.env[0, :, :].shape)*np.nan
         for pt, survey in zip(self.sites, self.comms):
             survey_len_arr[int(pt[0]), int(pt[1])] = len(survey)
@@ -1125,7 +1127,7 @@ class Sim:
         ax.set_title('α-diversity at surveyed sites', size=14)
 
         # plot PCA rast from GDM transform
-        ax = fig.add_subplot(gs[50:, 70:])
+        ax = fig.add_subplot(gs[50:, 35:65])
         self.gdm_pca_rast.plot.imshow(ax=ax)
         # add survey sites
         if scatter_survey_sites:
@@ -1143,20 +1145,24 @@ class Sim:
         ax.set_title('top 3 PCs from GDM transform')
 
         # format plot and save
-        fig.subplots_adjust(hspace=25,
-                            wspace=25,
+        fig.subplots_adjust(hspace=.25,
+                            wspace=.25,
                            )
         fig.show()
         if save:
            fig.savefig('comm_sim_res.png',
                         dpi=500,
                        )
+        return fig
+
 
     def plot_expec_vs_obser_distr(self,
                                   sp: int,
                                   title: Optional[str] = None,
                                   cmap: str = 'viridis',
                                   save: bool = False,
+                                  expec_ax: Axes = None,
+                                  obser_ax: Axes = None,
                                  ) -> None:
         '''
         plot both the expected and observed distribution of the given species
@@ -1186,49 +1192,57 @@ class Sim:
                     obser[i, j] = np.nan
         # plot both
         show_fig = False
-        fig = plt.figure(figsize=(14,8))
+        if expec_ax is None or obser_ax is None:
+            make_fig = True
+            fig = plt.figure(figsize=(14,8))
+        else:
+            make_fig = False
         if title is None:
             title = f"sp. {sp}"
             if self.spp[sp].prob_detect is not None:
                 title = title + " ($P(detect) = %0.2f$)" % self.spp[sp].prob_detect
-        fig.suptitle(title)
-        gs = fig.add_gridspec(nrows=80, ncols=140)
-        axs_env = [fig.add_subplot(gs[:25,
+        if make_fig:
+            fig.suptitle(title)
+            gs = fig.add_gridspec(nrows=80, ncols=140)
+            axs_env = [fig.add_subplot(gs[:25,
                 (i*20)+(i*5):(i+1)*20+(i*5)]) for i in range(self.env.shape[0])]
-        ax_expec = fig.add_subplot(gs[25:, :55])
-        ax_obser = fig.add_subplot(gs[25:, 85:])
-        for i, e in enumerate(self.env):
-            ax = axs_env[i]
-            img = ax.imshow(e,
-                            vmin=self._env_min_vals[i],
-                            vmax=self._env_max_vals[i],
-                            cmap=self._env_cmaps[i],
+            expec_ax = fig.add_subplot(gs[25:, :55])
+            obser_ax = fig.add_subplot(gs[25:, 85:])
+            for i, e in enumerate(self.env):
+                ax = axs_env[i]
+                img = ax.imshow(e,
+                                vmin=self._env_min_vals[i],
+                                vmax=self._env_max_vals[i],
+                                cmap=self._env_cmaps[i],
+                               )
+                ax.set_xticks(())
+                ax.set_xticks(())
+                plt.colorbar(img)
+                ax.set_title("$Env_%s$" % i, size=14)
+        im = expec_ax.imshow(expec,
+                             cmap=cmap,
+                             vmin=0,
+                             vmax=1,
+                            )
+        plt.colorbar(im, label='$P(presence)$')
+        expec_ax.set_title(f'sp. {sp}: expected')
+        im = obser_ax.imshow(obser,
+                             cmap=cmap,
+                             vmin=0,
+                             vmax=1,
+                            )
+        plt.colorbar(im, label='$presence$')
+        obser_ax.set_title(f'sp. {sp}: observed')
+        if make_fig:
+            fig.subplots_adjust(hspace=0.25,
+                                wspace=0.25,
+                               )
+            fig.show()
+            if save:
+                fig.savefig(f'comm_sim_sp{sp}_expec_vs_obser_distr.png',
+                            dpi=500,
                            )
-            ax.set_xticks(())
-            ax.set_xticks(())
-            plt.colorbar(img)
-            ax.set_title("$Env_%s$" % i, size=14)
-        img = ax_expec.imshow(expec,
-                              cmap=cmap,
-                              vmin=0,
-                              vmax=1,
-                             )
-        plt.colorbar(img)
-        ax_expec.set_title('expected distribution')
-        ax_obser.imshow(obser,
-                         cmap=cmap,
-                         vmin=0,
-                         vmax=1,
-                        )
-        ax_obser.set_title('observed distribution')
-        fig.subplots_adjust(hspace=0.25,
-                            wspace=0.25,
-                           )
-        fig.show()
-        if save:
-           fig.savefig(f'comm_sim_sp{sp}_expec_vs_obser_distr.png',
-                        dpi=500,
-                       )
+            return fig
 
 
 def run_demo(seed=2,
@@ -1252,6 +1266,9 @@ def run_demo(seed=2,
     GDM_DATA_TYPE = 'abund'
     if seed is not None:
         np.random.seed(seed)
+    # param to determine number of species on whole landscape
+    # (i.e., 'inventory' diversity, a la Whittaker)
+    GAMMA=20
     # knots and coeffs for f(Env)
     knots = ([-1.5, -1, 0, 1, 1.5],
              [-1.3, -0.2, 0.2, 1.1, 1.3],
@@ -1279,8 +1296,6 @@ def run_demo(seed=2,
         ENV = [nlmpy.blendArrays([e, n]) for e, n in zip(ENV, NOISE)]
     # rescale to a normal centered on 0
     ENV = [_rescale_arr(e, new_scale=fenv._x_minmax) for fenv, e in zip(FENV, ENV)]
-    # params to determine 'inventory' diversities (a la Whittaker)
-    GAMMA=2000
     # species-species lambdas (for ~Pois distributions determining abundance)
     MAX_POISSON_LAMBDAS = None
     # detection probability vector (or None, to have randomly assigned)
@@ -1305,18 +1320,23 @@ def run_demo(seed=2,
     # run GDM on full communities
     sim.run_GDM(surveys=None, implementation=gdm_implementation)
     # plot and save results
-    sim.plot(scatter_survey_sites=False,
-             plot_fenv_input=False,
-             title='before change',
-             save=True,
-            )
+    fig = sim.plot(scatter_survey_sites=False,
+                   plot_fenv_input=True,
+                   title='before change'*use_env_change,
+                   save=False,
+                  )
+    gs = fig.axes[-1].get_subplotspec().get_gridspec()
+    expec_ax = fig.add_subplot(gs[65:80, 67:82])
+    obser_ax = fig.add_subplot(gs[65:80, 85:])
     # plot expected vs. observed distribution for random species
     sp = [0]
     for s in sp:
         sim.plot_expec_vs_obser_distr(sp=s,
                                       title=f"before change: sp {s}",
                                       cmap='viridis',
-                                      save=True,
+                                      save=False,
+                                      expec_ax=expec_ax,
+                                      obser_ax=obser_ax,
                                      )
     # deepcopy sim (just in case)
     sim_b4 = deepcopy(sim)
@@ -1328,18 +1348,23 @@ def run_demo(seed=2,
         sim.update_env(ENV)
         sim.run_GDM(surveys=None, implementation=gdm_implementation)
         # plot again
-        sim.plot(scatter_survey_sites=False,
-                 plot_fenv_input=False,
-                 title='after change',
-                 save=True,
-                )
+        fig = sim.plot(scatter_survey_sites=False,
+                       plot_fenv_input=True,
+                       title='after change',
+                       save=False,
+                      )
+        gs = fig.axes[-1].get_subplotspec().get_gridspec()
+        expec_ax = fig.add_subplot(gs[65:80, 67:82])
+        obser_ax = fig.add_subplot(gs[65:80, 85:])
         # plot expected vs. observed distribution for random species
         sp = [0]
         for s in sp:
             sim.plot_expec_vs_obser_distr(sp=s,
                                           title=f"before change: sp {s}",
                                           cmap='viridis',
-                                          save=True,
+                                          save=False,
+                                          expec_ax=expec_ax,
+                                          obser_ax=obser_ax,
                                          )
     return sim
 
