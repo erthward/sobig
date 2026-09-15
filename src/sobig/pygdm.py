@@ -16,7 +16,7 @@ A self-contained Python port of the *core* functionality of the R package `gdm`
       relying on exact numbers. It should reproduce qualitatively similar
       transform shapes / PCA structure.)
 
-Main entry point: run_gdm()
+Main entry point: run_GDM()
 
 Dependencies: numpy, pandas, xarray, scipy, scikit-learn
 """
@@ -170,7 +170,7 @@ def _fit_gdm(X_spline, y, max_iter=100, tol=1e-7, inner_iters=5, eps=1e-6):
 # Main entry point
 # --------------------------------------------------------------------------
 
-def run_gdm(site_table, env_raster, abund=True, geo=False, n_splines=3,
+def run_GDM(site_table, env_raster, abund=True, geo=False, n_splines=3,
             curve_points=200, max_iter=100):
     """
     Port of the core GDM workflow (geo=FALSE case).

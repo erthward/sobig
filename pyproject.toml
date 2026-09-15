@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sobig"
-version = "0.1.5"
+version = "0.1.8"
 description = "Simulation of observations of biodiversity across gradients."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -13,6 +13,7 @@ authors = [
   { name = "Drew Terasaki Hart", email = "drew.terasaki.hart@gmail.com" }
 ]
 dependencies = [
+  "dill",
   "numpy",
   "pandas",
   "numba",

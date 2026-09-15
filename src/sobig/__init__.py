@@ -1,6 +1,6 @@
 """Simulation of observations of biodiversity across gradients."""
 
-__version__ = "0.1.0"
+#__version__ = "0.1.0"
 
 from .main import fEnv, Species, Sim, run_demo
 

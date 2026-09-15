@@ -15,6 +15,8 @@ import shutil
 import subprocess
 import warnings
 import time
+import os
+import dill
 from math import comb
 import rasterio as rio
 import xarray as xr
@@ -90,7 +92,7 @@ def _rescale_arr(arr: Union[vectorlike, rasterlike],
     '''
     assert len(new_scale) == 2
     new_range = new_scale[1] - new_scale[0]
-    assert new_range > 0
+    assert new_range >= 0
     out = deepcopy(arr)
     if by_rast_band:
         assert len(out.shape) == 3
@@ -307,7 +309,6 @@ class fEnv:
         if include_input:
             ax.plot(self.x,
                     y_plot,
-                    ':',
                     label='input',
                     linewidth=1.0,
                     color='black',
@@ -316,7 +317,6 @@ class fEnv:
         if self.x_gdm_fit is not None and self.y_gdm_fit is not None:
             ax.plot(self.x_gdm_fit,
                     self.y_gdm_fit,
-                    '-',
                     label='GDM fit',
                     linewidth=1.0,
                     color='red',
@@ -357,8 +357,6 @@ class Sim:
                  env: List[rasterlike],
                  fenvs: list[Type[fEnv]],
                  gamma: int,
-                 n_survey_sites: Optional[int] = None,
-                 survey_sites: Optional[List[Tuple[float]]] = None,
                  min_niche_sigma: float = 0.001,
                  max_niche_sigma: float = 0.1,
                  use_multivar_normal_niche: bool = False,
@@ -397,17 +395,10 @@ class Sim:
                        )
         # make niche KDE
         self._make_niche_kde()
-        # handle survey_sites
-        if survey_sites is None:
-            if n_survey_sites is None:
-                # create a point for every raster cell, if n_survey_sites not
-                # specified
-                n_survey_sites = np.prod(self._dims)
-            survey_sites = self._draw_random_survey_sites(n_survey_sites)
-        else:
-            assert n_survey_sites is None, ("If survey_sites are provided "
-                                            "then n_survey_sites must be None.")
-        self.sites = survey_sites
+        # create community sites
+        n_comms = np.prod(self._dims)
+        sites = self._get_community_sites(n_comms)
+        self.sites = sites
         self.n_sites = len(self.sites)
         # create all species
         self._make_all_species_runtime = None
@@ -477,6 +468,28 @@ class Sim:
         if env_changed:
             del self.comms
             self._sim_comms(verbose=verbose, timeit=timeit, debug=debug)
+
+
+    def _get_community_sites(self, n: int) -> List[Tuple[float]]:
+        '''
+        get the set of survey site points within a raster whose coordinates
+        range from 0 to dim-1 in both axes in dims; each point will be in a
+        separate raster cell, so n must not exceed the number of pixels
+        '''
+        dims = self._dims
+        assert n > 0 and n <= np.prod(dims)
+        X, Y = np.meshgrid(range(dims[0]), range(dims[1]))
+        xs = X.ravel()
+        ys = Y.ravel()
+        pts = [*zip(xs, ys)]
+        if n < np.prod(dims):
+            np.random.shuffle(pts)
+            idxs = np.random.choice(range(len(pts)), replace=False, size=n)
+        else:
+            idxs = np.array([*range(len(pts))])
+        # NOTE: add 0.5 to all site points, to place them in cell centers
+        pts = [tuple(np.array(pts[idx])+0.5) for idx in idxs]
+        return pts
 
 
     def _make_niche_kde(self,
@@ -569,189 +582,6 @@ class Sim:
         self.spp = spp
 
 
-    def _sim_comm(self,
-                  i: float,
-                  j: float,
-                  max_prob_pres: float = 1.0,
-                  prob_pres_thresh_round_to_1: Optional[float] = None,
-                  use_multivar_normal: bool = False,
-                  debug: bool = False,
-                 ) -> Dict[int, int]:
-        '''
-        use the list of environmental layers provided and the dict of species
-        and their niches to simulate complete community composition at grid cell i,j
-        '''
-        # list to store all species present
-        survey = {}
-        # get environmental values at point grid cell i,j
-        # NOTE: site points sit at cell centers, so int() converts to their cell indices
-        env_vals = [e[int(i), int(j)] for e in self.env]
-        for s, sp in self.spp.items():
-            # calculate presence probability
-            prob = self._calc_pres_prob(env_vals,
-                                   sp.niche,
-                                   use_multivar_normal=self._use_multivar_normal_niche,
-                                   prob_pres_thresh_round_to_1=self._prob_pres_thresh_round_to_1,
-                                 )
-            # determine presence as a Bernoulli draw on that probability
-            # NOTE: ... treating all layers as independent, even though
-            #       in reality we could actually fold in cross-layer
-            #       correlation to account for chance non-independence between
-            #       environmental axes...)
-            # NOTE: ... we also ignore spatial autocorrelation of presence in real
-            #       species by ignoring any information about whether or not the
-            #       species has been determined present in proximal locations...
-            if np.random.binomial(1, prob):
-                # if present, draw abundance from Poisson
-                # NOTE: altogether, this models survey results as an
-                # environmentally conditional zero-inflated Poisson
-                survey[s] = np.random.poisson(prob * sp.max_poisson_lambda)
-        return survey
-
-
-    def _sim_comms(self,
-                   verbose: Optional[bool] = None,
-                   timeit: Optional[bool] = None,
-                   debug: Optional[bool] = None,
-                  ) -> None:
-        '''
-        Produces a dict of observation lists, keyed to sampling schemes, if more
-        than one sampling scheme provided. Otherwise, returns an observation
-        list for the single sampling scheme.
-        '''
-        if verbose is None:
-            verbose = self._verbose
-        if timeit is None:
-            timeit = self._timeit
-        if debug is None:
-            debug = self._debug
-        if timeit:
-            start = time.time()
-        if verbose:
-            print(f"\n\nSIMULATING COMMUNITIES AT SURVEY POINTS...\n\n")
-        # create the simulated communities at each point
-        if not hasattr(self, 'comms'):
-            comms = []
-            ct = 0
-            for i, j in self.sites:
-                if verbose:
-                    if ct%25 == 0:
-                        print(f"\n\t{np.round(100*(ct/len(self.sites)), 1)}% complete...\n")
-                survey = self._sim_comm(i,
-                                       j,
-                                       use_multivar_normal=self._use_multivar_normal_niche,
-                                       prob_pres_thresh_round_to_1=self._prob_pres_thresh_round_to_1,
-                                       debug=debug,
-                                      )
-                comms.append(survey)
-                ct+=1
-                # store the full communities
-                self.comms = comms
-                # NOTE: flip the _env_changed flag to False (it will stay
-                # that way unless and until the env is updated again)
-                self._env_changed = False
-        else:
-            pass
-        # store and report runtime, as needed
-        if timeit:
-            stop = time.time()
-            runtime_sec = stop-start
-            self._runtime_sim_comms = runtime_sec
-            if verbose:
-                print(("\n\nALL COMMUNITIES SIMULATED IN "
-                       f"{np.round(self._runtime_sim_comms/60, 2)} "
-                       "MINUTES.\n\n"))
-
-
-    def sim_obs(self,
-                scheme: str = 'perfect',
-                efforts: Optional[vectorlike] = None,
-                by_rel_abund: bool = False,
-                by_detect_prob: bool = False,
-                verbose: Optional[bool] = None,
-                timeit: Optional[bool] = None,
-                debug: Optional[bool] = None,
-               ) -> List[Dict[int, int]]:
-        '''
-        Simulate observations at all survey_sites using the given scheme
-        (defaults to 'perfect', which simply returns the complete
-        simulated communities at each site), site-specific measures of effort
-        (defaults to None, which returns a single 'opportunistic' sighting),
-        and whether sampling probabilities should be determined as a function of
-        relative abundances and/or species' intrinsic detection probabilities
-        (both default to None, which yields uniform sampling probabilities
-        across all individuals)
-
-        Returns a list of observation dicts, one per survey sites, with each
-        dict containing key:value pairs of species_id:count
-        '''
-        if efforts is not None:
-            assert type(efforts) in [list, tuple, np.ndarray]
-            assert len(efforts) == len(self.sites)
-            assert np.all(efforts >= 0)
-            assert np.all(efforts <= 1)
-        if verbose is None:
-            verbose = self._verbose
-        if timeit is None:
-            timeit = self._timeit
-        if debug is None:
-            debug = self._debug
-        if timeit:
-            start = time.time()
-        if verbose:
-            if scheme == 'perfect':
-                label = 'PERFECT '
-            elif scheme == 'sample':
-                label = ''
-            print(f"\n\nSIMULATING {label}SAMPLING "
-                  "AT SURVEY POINTS...\n\n")
-        # handle sampling-scheme arguments
-        assert scheme in ['perfect',
-                          'sample',
-                         ]
-        # return communities, if scheme is 'perfect'...
-        if scheme == 'perfect':
-            return self.comms
-        # ...otherwise, return list of simulated observations at each site
-        elif scheme == 'sample':
-            obs = []
-            tot = len(self.comms)
-            for i, comm in enumerate(self.comms):
-                if verbose and i % 100 == 0:
-                    print(f"\t{np.round((i+1)/tot*100, 1)}% complete...")
-                if efforts is not None:
-                    effort = efforts[i]
-                else:
-                    effort = None
-                ob = self._sim_sample(comm=comm,
-                                      effort=effort,
-                                      by_rel_abund=by_rel_abund,
-                                      by_detect_prob=by_detect_prob,
-                                     )
-                obs.append(ob)
-        return obs
-
-
-    def _draw_random_survey_sites(self,
-                                  n: int) -> List[Tuple[float]]:
-        '''
-        draw a set of random survey site points within a raster whose coordinates
-        range from 0 to dim-1 in both axes in dims; each point will be in a
-        separate pixel, so n must not exceed the number of pixels
-        '''
-        dims = self._dims
-        assert n > 0 and n <= np.prod(dims)
-        X, Y = np.meshgrid(range(dims[0]), range(dims[1]))
-        xs = X.ravel()
-        ys = Y.ravel()
-        pts = [*zip(xs, ys)]
-        np.random.shuffle(pts)
-        idxs = np.random.choice(range(len(pts)), replace=False, size=n)
-        # NOTE: add 0.5 to all site points, to place them in cell centers
-        rand_pts = [tuple(np.array(pts[idx])+0.5) for idx in idxs]
-        return rand_pts
-
-
     def _calc_pres_prob(self,
                         env_vals: vectorlike,
                         niche: Tuple[float],
@@ -824,6 +654,344 @@ class Sim:
         return prob
 
 
+    def _sim_comm(self,
+                  i: float,
+                  j: float,
+                  max_prob_pres: float = 1.0,
+                  prob_pres_thresh_round_to_1: Optional[float] = None,
+                  use_multivar_normal: bool = False,
+                  debug: bool = False,
+                 ) -> Dict[int, int]:
+        '''
+        use the list of environmental layers provided and the dict of species
+        and their niches to simulate complete community composition at grid cell i,j
+        '''
+        # list to store all species present
+        survey = {}
+        # get environmental values at point grid cell i,j
+        # NOTE: site points sit at cell centers, so int() converts to their cell indices
+        env_vals = [e[int(i), int(j)] for e in self.env]
+        for s, sp in self.spp.items():
+            # calculate presence probability
+            prob = self._calc_pres_prob(env_vals,
+                                   sp.niche,
+                                   use_multivar_normal=self._use_multivar_normal_niche,
+                                   prob_pres_thresh_round_to_1=self._prob_pres_thresh_round_to_1,
+                                 )
+            # determine presence as a Bernoulli draw on that probability
+            # NOTE: ... treating all layers as independent, even though
+            #       in reality we could actually fold in cross-layer
+            #       correlation to account for chance non-independence between
+            #       environmental axes...)
+            # NOTE: ... we also ignore spatial autocorrelation of presence in real
+            #       species by ignoring any information about whether or not the
+            #       species has been determined present in proximal locations...
+            if np.random.binomial(1, prob):
+                # if present, draw abundance from Poisson
+                # NOTE: altogether, this models survey results as an
+                # environmentally conditional zero-inflated Poisson
+                survey[s] = np.random.poisson(prob * sp.max_poisson_lambda)
+        return survey
+
+
+    def _sim_comms(self,
+                   verbose: Optional[bool] = None,
+                   timeit: Optional[bool] = None,
+                   debug: Optional[bool] = None,
+                  ) -> None:
+        '''
+        Produces a list of dicts, where each dict is the community (species id
+        keys and count values) at each site in self.sites.
+        '''
+        if verbose is None:
+            verbose = self._verbose
+        if timeit is None:
+            timeit = self._timeit
+        if debug is None:
+            debug = self._debug
+        if timeit:
+            start = time.time()
+        if verbose:
+            print(f"\n\nSIMULATING COMMUNITIES AT SURVEY POINTS...\n\n")
+        # create the simulated communities at each point
+        if not hasattr(self, 'comms'):
+            comms = []
+            ct = 0
+            for i, j in self.sites:
+                if verbose:
+                    if ct%25 == 0:
+                        print(f"\n\t{np.round(100*(ct/len(self.sites)), 1)}% complete...\n")
+                survey = self._sim_comm(i,
+                                       j,
+                                       use_multivar_normal=self._use_multivar_normal_niche,
+                                       prob_pres_thresh_round_to_1=self._prob_pres_thresh_round_to_1,
+                                       debug=debug,
+                                      )
+                comms.append(survey)
+                ct+=1
+                # store the full communities
+                self.comms = comms
+                # NOTE: flip the _env_changed flag to False (it will stay
+                # that way unless and until the env is updated again)
+                self._env_changed = False
+        else:
+            pass
+        # store and report runtime, as needed
+        if timeit:
+            stop = time.time()
+            runtime_sec = stop-start
+            self._runtime_sim_comms = runtime_sec
+            if verbose:
+                print(("\n\nALL COMMUNITIES SIMULATED IN "
+                       f"{np.round(self._runtime_sim_comms/60, 2)} "
+                       "MINUTES.\n\n"))
+
+
+    def save_to_file(self, filepath):
+        """
+        Save entire `Sim` object to a pickle file (i.e., .pkl).
+        """
+        assert filepath.endswith('.pkl')
+        with open(filepath, "wb") as f:
+            dill.dump(self, f)
+
+
+    @classmethod
+    def load_from_file(cls, filepath):
+        """
+        Load a `Sim` object from a pickle file (i.e., .pkl).
+        """
+        assert filepath.endswith('.pkl')
+        with open(filepath, "rb") as f:
+            return dill.load(f)
+
+
+    def _get_site_indices(self, survey_sites):
+        """
+        Returns the integer site indices pertaining to each of a list of survey
+        sites, which can be directly used to index self.sites or self.comms.
+        """
+        if survey_sites is None:
+            list_inds = [*range(len(self.sites))]
+        else:
+            # NOTE: 1 and 0 are reverse-ordered because x,y site expression from user
+            #       tranlsates to j,i indexing the way sites are identified in the model
+            for s in survey_sites:
+                assert 0<= s[1] <= self._dims[0]
+                assert 0<= s[0] <= self._dims[1]
+            # NOTE: each cell covers the span from its LL corner to just before its
+            #       UR corner, and Py zero-indexed, so this works out to any pair
+            #       of continuous coordinates being directly covertable to its cell
+            #       using simple int flooring
+            #       (e.g., (0.76, 2.3) falls within cell 2,0, which ranges from 0
+            #       to just less than 1 in the x dimension and 2 to just less than
+            #       3 in the y dimension)
+            # NOTE: sites are id'd by the coordinate pair of their centroids, so
+            #       add 0.5 to each
+            cell_inds = [(int(s[0])+0.5, int(s[1])+0.5) for s in survey_sites]
+            list_inds = [[i for i, s in enumerate(self.sites)
+                          if s==cell_ind][0] for cell_ind in cell_inds]
+        return list_inds
+
+
+    def sim_obs(self,
+                scheme: str = 'perfect',
+                abund: bool = True,
+                absen: bool = True,
+                survey_sites: List[Tuple(float, float)] = None,
+                effort: Optional[Union[int, float, list, tuple, np.ndarray]] = None,
+                by_rel_abund: bool = True,
+                by_detect_prob: bool = False,
+                save: bool = False,
+                site_survey_filepath: str = None,
+                save_env: bool = False,
+                env_raster_filepath: str = None,
+                allow_overwrite: bool = False,
+                verbose: Optional[bool] = None,
+                timeit: Optional[bool] = None,
+                debug: Optional[bool] = None,
+               ) -> pd.DataFrame:
+        '''
+        Simulate observed species samples from a community.
+
+        Simulates observations at all survey_sites using the given scheme
+        (defaults to 'perfect', which simply returns the complete
+        simulated communities at each site), site-specific measures of effort
+        (defaults to None, which returns a single 'opportunistic' sighting),
+        and whether sampling probabilities should be determined as a function of
+        relative abundances and/or species' intrinsic detection probabilities
+        (both default to None, which yields uniform sampling probabilities
+        across all individuals)
+
+        Returns a list of observation dicts, one per survey site, with each
+        dict containing key:value pairs of species_id:count
+
+        Parameters
+        ----------
+        scheme : str
+            Sampling scheme to use. Can be one of:
+            - ``'perfect'`` : perfect detection, no sampling error.
+            - ``'sample'`` : stochastic sampling of the underlying community.
+        abund : bool, default True
+            If True, report species' sampled abundances. If False, report presence
+            only. Combines with `absen` to determine output data type (see Notes).
+        absen : bool, default True
+            If True, include species' absences (zero counts) in the output.
+            Combines with `abund` to determine output data type (see Notes).
+        survey_sites : list of two-tuples of floats, or None, default None
+            A list of tuples of the x,y coordinates of all sites to be sampled.
+            If None, defaults to taking one sample at the center of every
+            raster cell on the landscape, where each simulated community is
+            located.
+        effort : float, or int, or vectorlike, or None, default None
+            Per-site sampling effort, expressed as a float (or int) on the [0, 1]
+            interval (where 1 = 100% effort = whole community observed).
+            Can be a float (same sampling effort at all `survey_sites`) or a vectorlike
+            (numpy.ndarray, list, or tuple of per-site sampling efforts).
+            Defaults to None, which just returns a single observation per site.
+        by_rel_abund : bool, default True
+            If True, draw species observations in proportion to their relative
+            abundances, such that rarer species are observed less often. Can
+            be combined with `by_detect_prob` (see Notes).
+        by_detect_prob : bool, default False
+            If True, use each species' a priori specified detection
+            probability to determine whether it is sampled. Can be combined
+            with `by_rel_abund` (see Notes).
+        save : bool, default False
+            If True, saves results to file (ready for GDM input).
+        site_survey_filepath : str, default None
+            If `save` is True, a filepath must be provided for the site-survey
+            data to be saved to (and it must end with '.csv').
+        save_env : bool, default False
+            If True (and if `save` also True), saves landscape to a raster file
+            as well.
+        env_raster_filepath : str, default None
+            If `save_env` is True, a filepath must be provided for the
+            environment raster to be saved to (and it must end with '.tif').
+        allow_overwrite: bool, default False
+            Whether or not to allow existing files to be overwritten.
+        verbose : bool, default False
+            If True, print progress and diagnostic information.
+        timeit : bool, default False
+            If True, print the total runtime of the function.
+        debug : bool, default False
+            If True, print information useful for debugging.
+
+        Returns
+        -------
+        pandas.DataFrame
+            One row per sampling site, with site IDs and coordinates in 'site',
+            'x', and 'y' columns and counts of species i in 'spp<i>' columns.
+
+        Notes
+        -----
+        `abund` and `absen` jointly determine the output data type:
+
+        - ``abund=True, absen=True``   : abundance-absence data (counts, with
+          zeros for undetected species).
+        - ``abund=True, absen=False``   : abundance-only data (counts for only
+          species that were observed)
+        - ``abund=False, absen=True``  : presence-absence data (1/0, with
+          undetected species shown as 0).
+        - ``abund=False, absen=False`` : presence-only data (only detected
+          species are included, no zeros).
+
+        `by_rel_abund` and `by_detect_prob` may both be True at once, in which
+        case their effects combine multiplicatively: a species that is both
+        rare and hard to detect is less likely to be observed than either
+        factor alone would predict.
+        '''
+        # handle sampling-scheme arguments
+        assert scheme in ['perfect', 'sample']
+        if survey_sites is not None:
+            assert isinstance(survey_sites, list)
+            assert np.all([isinstance(s, tuple) for s in survey_sites])
+        if effort is not None:
+            if isinstance(effort, int):
+                assert effort == 0 or effort == 1
+                effort = float(effort)
+            if isinstance(effort, float):
+                assert 0 <= effort <= 1
+                efforts = [effort] * len(self.comms)
+            else:
+                assert type(effort) in [list, tuple, np.ndarray]
+                assert len(effort) == len(self.sites)
+                assert np.all(effort >= 0)
+                assert np.all(effort <= 1)
+        else:
+            efforts = None
+        if save:
+            assert site_survey_filepath is not None
+            assert site_survey_filepath.endswith('.csv')
+            if not allow_overwrite:
+                assert not os.path.isfile(site_survey_filepath)
+        if save_env:
+            assert env_raster_filepath is not None
+            assert env_raster_filepath.endswith('.tif')
+            if not allow_overwrite:
+                assert not os.path.isfile(env_raster_filepath)
+        if verbose is None:
+            verbose = self._verbose
+        if timeit is None:
+            timeit = self._timeit
+        if debug is None:
+            debug = self._debug
+        if timeit:
+            start = time.time()
+        if verbose:
+            if scheme == 'perfect':
+                label = 'PERFECT '
+            elif scheme == 'sample':
+                label = ''
+            print(f"\n\nSIMULATING {label}SAMPLING "
+                  "AT SURVEY POINTS...\n\n")
+        # get the site-indices associated with the input survey sites
+        site_inds = self._get_site_indices(survey_sites)
+        # just take communities, if scheme is 'perfect'...
+        if scheme == 'perfect':
+            obs = [self.comms[i] for i in site_inds]
+        # ...otherwise, get list of simulated observations at each site
+        elif scheme == 'sample':
+            obs = []
+            tot = len(site_inds)
+            for i, comm in enumerate([self.comms[i] for i in site_inds]):
+                if verbose and i % 100 == 0:
+                    print(f"\t{np.round((i+1)/tot*100, 1)}% complete...")
+                if efforts is not None:
+                    effort = efforts[i]
+                else:
+                    effort = None
+                ob = self._sim_sample(comm=comm,
+                                      effort=effort,
+                                      by_rel_abund=by_rel_abund,
+                                      by_detect_prob=by_detect_prob,
+                                     )
+                obs.append(ob)
+        # convert abundances to presences, if needed
+        if not abund:
+            obs = [{k: min((1, v)) for k,v in d.items()} for d in obs]
+        # add absences for unobserved species, if needed
+        if absen:
+            for ob in obs:
+                for spp in self.spp.keys():
+                    if spp not in ob:
+                        ob[spp] = 0
+        # save data, if needed
+        if abund:
+            bio_data_type = 'abun'
+        else:
+            bio_data_type = 'pres'
+        site_surv_df = self._prep_output_data(surveys=obs,
+                                              survey_pts=survey_sites,
+                                              bio_data_type=bio_data_type,
+                                              save_site_surveys=save,
+                                              site_survey_filename=site_survey_filepath,
+                                              save_env_rast=save_env,
+                                              env_rast_filename=env_raster_filepath,
+                                             )
+        return site_surv_df
+
+
     def _sim_sample(self,
                     comm: Dict[int, int],
                     effort: Optional[float] = None,
@@ -846,13 +1014,14 @@ class Sim:
         # get vector of probs that a single sighting happens to be of each species
         # (starts as all ones, then gets multiplied by needed values)
         sp_probs = np.ones(len(comm))
-        # multiply by abundances, if relative abundance factors into sampling probs
+        # multiply by abundances (normalized to probs),
+        # if relative abundance needs to factor into sampling probs
         if by_rel_abund:
-            sp_probs *= np.array([*comm.values()])
-        # mutliply by species intrinsic detection probabilities, if needed
+            sp_probs *= (np.array([*comm.values()])/(np.sum([*comm.values()])))
+        # mutliply by species' intrinsic detection probabilities, if needed
         if by_detect_prob:
             sp_probs *= np.array([self.spp[sp].prob_detect for sp in comm.keys()])
-        # now normalize to proper probabilities, for use in np.random.choice
+        # now renormalize to probabilities that sum to 1
         sp_probs = sp_probs/np.sum(sp_probs)
         assert np.allclose(np.sum(sp_probs), 1)
         # use effort and rarefaction to determine size of sample...
@@ -886,14 +1055,18 @@ class Sim:
         return sample
 
 
-    def _prep_GDM_input_data(self,
-                             surveys: List[Dict[int, int]],
-                             bio_data_type: str = 'abund',
-                             site_survey_filename: str = 'sobig_site_survey.csv',
-                             env_rast_filename: str = 'sobig_env_rast.tif',
-                            ) -> None:
+    def _prep_output_data(self,
+                          surveys: List[Dict[int, int]],
+                          survey_pts: List[Tuple(float, float)] = None,
+                          bio_data_type: str = 'abun',
+                          save_site_surveys: bool = False,
+                          site_survey_filename: str = 'sobig_site_survey.csv',
+                          save_env_rast: bool = False,
+                          env_rast_filename: str = 'sobig_env_rast.tif',
+                         ) -> None:
         '''
-        prep a set of files to input into a basic R script for running a GDM model
+        prep a set of files for ouput (formatted to match inputs
+        for the basic R script for running GDM)
         '''
         # create and save 'site-survey' table
         # (sites in rows, species in columns)
@@ -905,43 +1078,52 @@ class Sim:
         # NOTE: add site column
         site_surv_mat[:, 0] = [*range(len(surveys))]
         for i, survey in enumerate(surveys):
-            # NOTE: adding x and y columns (sites are expressed as (i, j) matrix
-            #       indices, so flip them express as (x, y) geographic coordinates)
-            pt = self.sites[i]
+            # add x and y survey-point columns
+            if survey_pts is not None:
+                pt = survey_pts[i]
+            else:
+            # NOTE: sites are expressed as (i, j) matrix indices,
+            #       so flip them to express as (x, y) geographic coordinates)
+                pt = self.sites[i]
             site_surv_mat[i, 1] = pt[1]
             site_surv_mat[i, 2] = pt[0]
             for j, abund in survey.items():
-                if bio_data_type == 'abund':
-                    site_surv_mat[i, j+add_cols] = abund
-                elif bio_data_type == 'pres_abs':
-                    site_surv_mat[i, j+add_cols] = 1
+                site_surv_mat[i, j+add_cols] = abund
+            # convert counts to presences, if needed
+            if bio_data_type == 'pres':
+                site_surv_mat[:, 3:] = np.clip(site_surv_mat[:, 3:], a_min=None, a_max=1)
         site_surv_df = pd.DataFrame(site_surv_mat)
         site_surv_df.columns = ['site', 'x', 'y'] + [f'spp{i}' for i in range(n_spp)]
-        site_surv_df.to_csv(site_survey_filename, index=False)
-        print("\nGDM SITES TABLE SAVED TO DISK.\n")
+        if save_site_surveys:
+            site_surv_df.to_csv(site_survey_filename, index=False)
+        print("\nSITE-DATA TABLE SAVED TO DISK.\n")
         # create and save environmental raster
-        ydim, xdim = self.env.shape[1], self.env.shape[2]
-        n_bands = self.env.shape[0]
-        dtype = self.env.dtype
-        crs = 'EPSG:3857' # just a stand-in projected EPSG, to avoid CRS issues
-        transform = rio.transform.from_origin(0, ydim, 1, 1) # top-left corner
-        with rio.open(env_rast_filename,
-                      'w',
-                      driver='GTiff',
-                      height=ydim,
-                      width=xdim,
-                      count=n_bands,
-                      dtype=dtype,
-                      crs=crs,
-                      transform=transform) as dst:
-            for n in range(n_bands):
-                dst.write(self.env[n], n + 1)
-        print("\nGDM ENV RAST SAVED TO DISK.\n")
+        if save_env_rast:
+            ydim, xdim = self.env.shape[1], self.env.shape[2]
+            n_bands = self.env.shape[0]
+            dtype = self.env.dtype
+            crs = 'EPSG:3857' # just a stand-in projected EPSG, to avoid CRS issues
+            transform = rio.transform.from_origin(0, ydim, 1, 1) # top-left corner
+            with rio.open(env_rast_filename,
+                          'w',
+                          driver='GTiff',
+                          height=ydim,
+                          width=xdim,
+                          count=n_bands,
+                          dtype=dtype,
+                          crs=crs,
+                          transform=transform) as dst:
+                for n in range(n_bands):
+                    dst.write(self.env[n], n + 1)
+            print("\nENV RAST SAVED TO DISK.\n")
+        else:
+            print("\nENV RAST NOT SAVED.\n")
+        return site_surv_df
 
 
     def run_GDM(self,
                 surveys: Optional[List[Dict[int, int]]] = None,
-                gdm_data_type: str = 'abund',
+                gdm_data_type: str = 'abun',
                 site_survey_filename: str = 'sobig_site_survey.csv',
                 env_rast_filename: str = 'sobig_env_rast.tif',
                 delete_intermed_files: bool = False,
@@ -951,7 +1133,7 @@ class Sim:
                 plot_fenv_input: bool = True,
                 plot_title: str = '',
                 verbose: bool = False,
-                implementation: str = '_r', # NOTE: 'r' runs GDM using the Fitzpatrik
+                implementation: str = 'r', # NOTE: 'r' runs GDM using the Fitzpatrik
                                             #       et al. code;
                                             #       'py' runs GDM hastily ported to
                                             #       Python by Claude (since I suddenly
@@ -967,35 +1149,38 @@ class Sim:
         port of it and return resulting ispline fits and PCA-transformed raster
         '''
         assert isinstance(gdm_data_type, str)
-        assert gdm_data_type in ['abund', 'pres_abs']
+        assert gdm_data_type in ['abun', 'pres']
         assert implementation in ['r', 'py']
         print(f"\n\nRUNNING GDM...\n\n")
         # use the complete communities, if surveys were not provided
         if surveys is None:
             surveys = self.comms
         # prep and save GDM input data
-        self._prep_GDM_input_data(surveys=surveys,
-                                  bio_data_type=gdm_data_type,
-                                  site_survey_filename=site_survey_filename,
-                                  env_rast_filename=env_rast_filename,
-                                 )
+        site_surv_df = self._prep_output_data(surveys=surveys,
+                                              survey_pts=None,
+                                              bio_data_type=gdm_data_type,
+                                              save_site_surveys=True,
+                                              site_survey_filename=site_survey_filename,
+                                              save_env_rast=True,
+                                              env_rast_filename=env_rast_filename,
+                                             )
         if implementation == 'r':
             if shutil.which("Rscript") is None:
                 warnings.warn("Rscript was not found on the system. "
                               "Skipping GDM analysis. Please ensure R is installed and "
                               "Rscript is available on your PATH.\n"
-                              "Meanwhile, defaulting to slower Python implementation of GDM.",
+                              "Meanwhile, defaulting to slower Python implementation of GDM.\n\n",
                               RuntimeWarning,
                              )
                 implementation = 'py'
         if implementation == 'r':
             # run R script
-            if gdm_data_type == 'abund':
+            if gdm_data_type == 'abun':
                 abund = 'TRUE'
             else:
                 abund = 'FALSE'
 
-            r_script = files("sobig").joinpath("r", "run_gdm.R")
+            r_script = files("sobig").joinpath("_r", "run_gdm.R")
             with as_file(r_script) as script_path:
                 R_cmd = ["Rscript",
                          "--vanilla",
@@ -1017,7 +1202,7 @@ class Sim:
                               "This may indicate that R and/or the R 'gdm' package "
                               "are not properly installed.\n"
                               f"R output:\n{result.stderr}\n"
-                              "Meanwhile, defaulting to slower Python implementation of GDM.",
+                              "Meanwhile, defaulting to slower Python implementation of GDM.\n\n",
                               RuntimeWarning,
                              )
                 implementation = 'py'
@@ -1028,9 +1213,9 @@ class Sim:
         if implementation == 'py':
             site_survey_df = pd.read_csv(site_survey_filename)
             env_rast = rxr.open_rasterio(env_rast_filename)
-            gdm_fits, pca_rast = pygdm.run_gdm(site_table=site_survey_df,
+            gdm_fits, pca_rast = pygdm.run_GDM(site_table=site_survey_df,
                                                env_raster=env_rast,
-                                               abund=gdm_data_type=='abund',
+                                               abund=gdm_data_type=='abun',
                                                geo=False,
                                                n_splines=3,
                                                curve_points=200,
@@ -1056,7 +1241,7 @@ class Sim:
                                                         ['PC1', 'PC2', 'PC3']})
         self.gdm_pca_rast = pca_rast_rescaled
         if plot_it:
-            sim.plot(scatter_survey_sites=False,
+            sim.plot(scatter_sites=False,
                      plot_fenv_input=plot_fenv_input,
                      title=plot_title,
                      save=False,
@@ -1069,7 +1254,7 @@ class Sim:
 
 
     def plot(self,
-             scatter_survey_sites: bool = True,
+             scatter_sites: bool = True,
              plot_fenv_input: bool = True,
              title: str = '',
              save: bool = False,
@@ -1093,7 +1278,7 @@ class Sim:
                            )
             plt.colorbar(img)
             # add survey sites
-            if scatter_survey_sites:
+            if scatter_sites:
                 for point in self.sites:
                     ax.scatter(point[0],
                                point[1],
@@ -1135,7 +1320,7 @@ class Sim:
         ax = fig.add_subplot(gs[50:, 35:65])
         self.gdm_pca_rast.plot.imshow(ax=ax)
         # add survey sites
-        if scatter_survey_sites:
+        if scatter_sites:
             for point in self.sites:
                 ax.scatter(point[0],
                            point[1],
@@ -1250,12 +1435,16 @@ class Sim:
             return fig
 
 
-def run_demo(seed=2,
+def run_demo(seed=1,
              use_env_change=False,
              gdm_implementation='r',
             ):
     """
-    run a simple demo of sobig's functionality
+    run a simple demo of sobig's functionality,
+    using the give seed number for random number generation,
+    the indicated GDM implementation,
+    and optionally producing a second plot to indicate the effect
+    of an environmental change event
     """
     # behavioral params
     VERBOSE = True
@@ -1268,12 +1457,12 @@ def run_demo(seed=2,
     MAX_NICHE_SIGMA = 1.5
     PROB_PRES_THRESH_ROUND_TO_1 = None
     MAX_POISSON_LAMBDA_ACROSS_SPP = 1000
-    GDM_DATA_TYPE = 'abund'
+    GDM_DATA_TYPE = 'abun'
     if seed is not None:
         np.random.seed(seed)
     # param to determine number of species on whole landscape
     # (i.e., 'inventory' diversity, a la Whittaker)
-    GAMMA=20
+    GAMMA = 20
     # knots and coeffs for f(Env)
     knots = ([-1.5, -1, 0, 1, 1.5],
              [-1.3, -0.2, 0.2, 1.1, 1.3],
@@ -1309,8 +1498,6 @@ def run_demo(seed=2,
     sim = Sim(env=ENV,
               fenvs=FENV,
               gamma=GAMMA,
-              n_survey_sites=None,
-              survey_sites=None,
               min_niche_sigma=MIN_NICHE_SIGMA,
               max_niche_sigma=MAX_NICHE_SIGMA,
               use_multivar_normal_niche=USE_MULTIVAR_NORMAL_NICHE,
@@ -1325,12 +1512,12 @@ def run_demo(seed=2,
     # run GDM on full communities
     sim.run_GDM(surveys=None,
                 implementation=gdm_implementation,
-                site_survey_filename: str = 'sobig_demo_site_survey.csv',
-                env_rast_filename: str = 'sobig_demo_env_rast.tif',
+                site_survey_filename = 'sobig_demo_site_survey.csv',
+                env_rast_filename = 'sobig_demo_env_rast.tif',
                 delete_intermed_files=True,
                )
     # plot and save results
-    fig = sim.plot(scatter_survey_sites=False,
+    fig = sim.plot(scatter_sites=False,
                    plot_fenv_input=True,
                    title='before change'*use_env_change,
                    save=False,
@@ -1358,12 +1545,12 @@ def run_demo(seed=2,
         sim.update_env(ENV)
         sim.run_GDM(surveys=None,
                     implementation=gdm_implementation,
-                    site_survey_filename: str = 'sobig_demo_site_survey.csv',
-                    env_rast_filename: str = 'sobig_demo_env_rast.tif',
+                    site_survey_filename = 'sobig_demo_site_survey.csv',
+                    env_rast_filename = 'sobig_demo_env_rast.tif',
                    delete_intermed_files=True,
                    )
         # plot again
-        fig = sim.plot(scatter_survey_sites=False,
+        fig = sim.plot(scatter_sites=False,
                        plot_fenv_input=True,
                        title='after change',
                        save=False,
